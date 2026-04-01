@@ -1,52 +1,2733 @@
-ENERGYCASCADE.py — v4.0 → v5.0 Upgrade Walkthrough
-Summary of Changes
-The ORCA Energy Cascade Plotter has been upgraded from v4.0 to v5.0 with the following professional-grade improvements:
+import os
+os.environ['QT_API'] = 'pyside6'
 
-1. Performance — Cached File Parsing
-Added get_cached_parser() with mtime-based invalidation
-.out files are now parsed once and cached in memory
-Cache auto-invalidates when file modification time changes
-All OrcaParser() calls in calculate_state_energy() and update_data_table() replaced with cached version
-2. Undo / Redo System
-New UndoManager class with 50-level deep-copy snapshot stack
-Ctrl+Z / Ctrl+Shift+Z keyboard shortcuts
-Edit → Undo / Redo menu items
-Undo pushes wired into all mutating operations:
-Label editor, duplicate, rename, color change
-Reorder (move up/down), remove, clear
-Drag interactions (push on press, dirty on release)
-Reset labels, auto-align labels
-3. Drag Improvements
-canvas.draw_idle() used for smoother deferred redraws during drag
-Undo snapshot captured on drag start, dirty flag set on release
-4. Bug Fixes
-Fix	Detail
-app.setStyle("Professional") → "Fusion"	Was silently falling back to platform default
-Label editor None assignment	Removed the if value is not None guard that was preventing reset-to-defaults
-load_session() skip prompt	Now passes _skip_prompt=True to new_session()
-FolderLoader cleanup in load	Added .deleteLater() to prevent orphaned threads
-5. Full Session Persistence
-New: _gather_all_settings() / _restore_all_settings() methods
-Session JSON now saves/restores all widget states:
-All spin boxes (font sizes, bar thickness, margins, figure dimensions)
-All checkboxes (17 total: grid, shadows, overlay, smooth, etc.)
-All combo boxes (theme, legend location, line style, zero reference)
-Unit button states (kcal/mol, kJ/mol, eV)
-Session format versioned (version: 2) for future migration support
-6. CSV Import (Feature Completion)
-import_data() now fully functional
-Accepts CSV with columns: Label, Energy_Eh, Color (optional)
-Creates PlotItem entries with direct energy values (no .out file needed)
-calculate_state_energy() handles item.energy for imported data
-7. UI Polish
-Double-click staging list item → opens label editor
-Dirty state tracking (self._dirty) across all mutations
-Smart close event: Save / Discard / Cancel dialog when dirty
-Window title updated to v5.0
-About dialog lists all new features
-8. Plot Quality
-Automatic Y-axis padding: 8% below, 12% above data range for label clearance
-Verified
-✅ Python syntax validation passed (py_compile.compile with Python 3.x)
-✅ All existing features preserved — no breaking changes
-✅ Old session files still load (backward compatible, just missing new settings which use defaults)
+import sys
+import re
+import json
+import csv
+import copy
+import numpy as np
+import matplotlib
+from functools import lru_cache
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Tuple, Optional, Any
+from itertools import cycle, groupby
+from io import BytesIO
+
+matplotlib.use('QtAgg')
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib import style as mpl_style
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QTabWidget, QListWidget, QListWidgetItem, QPushButton,
+    QLabel, QLineEdit, QComboBox, QCheckBox, QDoubleSpinBox, QSpinBox,
+    QFormLayout, QGroupBox, QFileDialog, QMessageBox, QColorDialog,
+    QFrame, QScrollArea, QDialog, QDialogButtonBox,
+    QAbstractItemView, QTableWidget, QTableWidgetItem,
+    QHeaderView, QToolBar, QMenu, QStyle, QProgressDialog
+)
+from PySide6.QtCore import (
+    Qt, Signal, QObject, QSize, QThread, Slot, QMetaObject, Q_ARG
+)
+from PySide6.QtGui import (
+    QIcon, QColor, QAction, QPixmap, QImageReader,
+    QPainter, QBrush, QPen, QLinearGradient, QKeySequence
+)
+
+# ==================== Custom Widgets ====================
+class StyledListWidget(QListWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlternatingRowColors(True)
+        self.setStyleSheet("""
+            QListWidget {
+                background-color: #ffffff;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 4px;
+                font-size: 12px;
+            }
+            QListWidget::item {
+                padding: 8px;
+                margin: 2px;
+                border-radius: 6px;
+            }
+            QListWidget::item:selected {
+                background-color: #3b82f6;
+                color: white;
+                border: none;
+            }
+            QListWidget::item:hover:!selected {
+                background-color: #f3f4f6;
+            }
+        """)
+
+class GradientButton(QPushButton):
+    def __init__(self, text="", parent=None, color1="#3b82f6", color2="#2563eb"):
+        super().__init__(text, parent)
+        self.color1 = QColor(color1)
+        self.color2 = QColor(color2)
+        self.setMinimumHeight(40)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("""
+            QPushButton {
+                border: none;
+                border-radius: 8px;
+                font-weight: bold;
+                font-size: 13px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                opacity: 0.9;
+            }
+        """)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        alpha = 180 if self.isEnabled() else 80
+        c1 = QColor(self.color1); c1.setAlpha(alpha)
+        c2 = QColor(self.color2); c2.setAlpha(alpha)
+        gradient.setColorAt(0, c1)
+        gradient.setColorAt(1, c2)
+        painter.setBrush(QBrush(gradient))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(self.rect(), 8, 8)
+        painter.setPen(QPen(Qt.white))
+        painter.setFont(self.font())
+        painter.drawText(self.rect(), Qt.AlignCenter, self.text())
+
+class ModernGroupBox(QGroupBox):
+    def __init__(self, title="", parent=None):
+        super().__init__(title, parent)
+        self.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #e5e7eb;
+                border-radius: 12px;
+                margin-top: 12px;
+                padding-top: 16px;
+                background-color: #ffffff;
+                font-size: 13px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 16px;
+                padding: 0 8px 0 8px;
+                color: #1f2937;
+            }
+        """)
+
+# ==================== Data Classes ====================
+@dataclass
+class PlotItem:
+    file_data: List[Tuple[str, float]]
+    display_name: str
+    folder_path: str
+    custom_name: Optional[str] = None
+    custom_color: Optional[str] = None
+    energy: Optional[float] = None
+    label_offset: List[float] = field(default_factory=lambda: [0.0, 0.5])
+    delta_offset: List[float] = field(default_factory=lambda: [0.05, 0.0])
+    label_font_size: Optional[int] = None
+    label_font_weight: str = "normal"
+    label_font_color: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+# ==================== Label Editor Dialog ====================
+class LabelEditorDialog(QDialog):
+    def __init__(self, plot_item, parent=None):
+        super().__init__(parent)
+        self.plot_item = plot_item
+        self.setWindowTitle("Edit Label Properties")
+        self.setMinimumWidth(450)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f9fafb;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+                margin-top: 8px;
+                padding-top: 12px;
+            }
+            QLabel {
+                font-size: 12px;
+            }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                padding: 6px;
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                background-color: white;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+
+        name_group = QGroupBox("State Label")
+        name_layout = QFormLayout(name_group)
+        self.name_edit = QLineEdit(plot_item.custom_name or plot_item.display_name)
+        name_layout.addRow("Label Text:", self.name_edit)
+        layout.addWidget(name_group)
+
+        color_group = QGroupBox("Colors")
+        color_layout = QFormLayout(color_group)
+
+        self.state_color_btn = QPushButton("State Color")
+        self.state_color_btn.clicked.connect(self.choose_state_color)
+        self.state_color_btn.setStyleSheet(
+            f"background-color: {plot_item.custom_color or '#3b82f6'}; color: white; border-radius: 6px; padding: 6px;")
+
+        self.label_color_btn = QPushButton("Label Color")
+        self.label_color_btn.clicked.connect(self.choose_label_color)
+        label_color = plot_item.label_font_color or "#1f2937"
+        self.label_color_btn.setStyleSheet(
+            f"background-color: {label_color}; color: white; border-radius: 6px; padding: 6px;")
+
+        color_layout.addRow("State Color:", self.state_color_btn)
+        color_layout.addRow("Label Color:", self.label_color_btn)
+        layout.addWidget(color_group)
+
+        font_group = QGroupBox("Font Properties")
+        font_layout = QFormLayout(font_group)
+
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(6, 24)
+        self.font_size_spin.setValue(plot_item.label_font_size or 10)
+
+        self.font_weight_combo = QComboBox()
+        self.font_weight_combo.addItems(["normal", "bold", "light"])
+        self.font_weight_combo.setCurrentText(plot_item.label_font_weight)
+
+        font_layout.addRow("Font Size:", self.font_size_spin)
+        font_layout.addRow("Font Weight:", self.font_weight_combo)
+        layout.addWidget(font_group)
+
+        pos_group = QGroupBox("Position Offset")
+        pos_layout = QFormLayout(pos_group)
+
+        self.x_offset_spin = QDoubleSpinBox()
+        self.x_offset_spin.setRange(-5.0, 5.0)
+        self.x_offset_spin.setSingleStep(0.1)
+        self.x_offset_spin.setValue(plot_item.label_offset[0])
+
+        self.y_offset_spin = QDoubleSpinBox()
+        self.y_offset_spin.setRange(-5.0, 5.0)
+        self.y_offset_spin.setSingleStep(0.1)
+        self.y_offset_spin.setValue(plot_item.label_offset[1])
+
+        pos_layout.addRow("X Offset:", self.x_offset_spin)
+        pos_layout.addRow("Y Offset:", self.y_offset_spin)
+        layout.addWidget(pos_group)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Reset)
+        buttons.button(QDialogButtonBox.Reset).clicked.connect(self.reset_to_defaults)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.state_color = plot_item.custom_color
+        self.label_color = plot_item.label_font_color
+
+    def choose_state_color(self):
+        color = QColorDialog.getColor(QColor(self.state_color or "#3b82f6"))
+        if color.isValid():
+            self.state_color = color.name()
+            self.state_color_btn.setStyleSheet(
+                f"background-color: {self.state_color}; color: white; border-radius: 6px; padding: 6px;")
+
+    def choose_label_color(self):
+        color = QColorDialog.getColor(QColor(self.label_color or "#1f2937"))
+        if color.isValid():
+            self.label_color = color.name()
+            self.label_color_btn.setStyleSheet(
+                f"background-color: {self.label_color}; color: white; border-radius: 6px; padding: 6px;")
+
+    def reset_to_defaults(self):
+        self.name_edit.setText(self.plot_item.display_name)
+        self.state_color = None
+        self.label_color = None
+        self.font_size_spin.setValue(10)
+        self.font_weight_combo.setCurrentText("normal")
+        self.x_offset_spin.setValue(0.0)
+        self.y_offset_spin.setValue(0.5)
+        self.state_color_btn.setStyleSheet("background-color: #3b82f6; color: white; border-radius: 6px; padding: 6px;")
+        self.label_color_btn.setStyleSheet("background-color: #1f2937; color: white; border-radius: 6px; padding: 6px;")
+
+    def get_values(self):
+        return {
+            'custom_name': self.name_edit.text().strip() or None,
+            'custom_color': self.state_color,
+            'label_font_color': self.label_color,
+            'label_font_size': self.font_size_spin.value(),
+            'label_font_weight': self.font_weight_combo.currentText(),
+            'label_offset': [self.x_offset_spin.value(), self.y_offset_spin.value()]
+        }
+
+# ==================== Global File Browser Dialog ====================
+class GlobalFileBrowser(QDialog):
+    def __init__(self, folders_dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Global File Explorer - All .out Files")
+        self.resize(1000, 700)
+        self.selected_files = []
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f9fafb;
+            }
+            QLabel {
+                font-size: 12px;
+            }
+            QListWidget {
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+                background-color: white;
+                font-size: 12px;
+            }
+            QLineEdit {
+                padding: 8px;
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                font-size: 12px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel("Global File Explorer")
+        header.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: bold;
+                padding: 12px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #3b82f6, stop:1 #1e40af);
+                color: white;
+                border-radius: 8px;
+            }
+        """)
+        header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header)
+
+        search_lay = QHBoxLayout()
+        search_lay.addWidget(QLabel("🔍 Search Files:"))
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Filter by filename, subfolder, or parent folder...")
+        self.search_bar.textChanged.connect(self.filter_list)
+        search_lay.addWidget(self.search_bar)
+        layout.addLayout(search_lay)
+
+        self.file_list = QListWidget()
+        self.file_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.file_list.setAlternatingRowColors(True)
+        layout.addWidget(self.file_list)
+
+        self.status_label = QLabel("0 files found")
+        layout.addWidget(self.status_label)
+        layout.addWidget(QLabel(
+            "<i>💡 Tip: Use Ctrl or Shift to select multiple files to add at once.</i>"))
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Add Selected to Plot")
+        btns.button(QDialogButtonBox.Ok).setStyleSheet(
+            "background-color: #10b981; color: white; font-weight: bold; padding: 8px 16px; border-radius: 6px;")
+        btns.accepted.connect(self.handle_accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        self.all_items_data = []
+        for path, data in folders_dict.items():
+            folder_name = os.path.basename(path)
+            for rel, full in data['files']:
+                display = f"[{folder_name}] {rel}"
+                self.all_items_data.append((display, path, full, data['color']))
+
+        self.filter_list()
+
+    def filter_list(self):
+        self.file_list.clear()
+        query = self.search_bar.text().lower()
+        filtered_count = 0
+        for display, folder_path, full_path, color in self.all_items_data:
+            if query in display.lower():
+                item = QListWidgetItem(display)
+                item.setData(Qt.UserRole, (folder_path, full_path))
+                item.setForeground(QColor(color))
+                item.setToolTip(full_path)
+                if filtered_count % 2 == 0:
+                    item.setBackground(QColor(248, 250, 252))
+                self.file_list.addItem(item)
+                filtered_count += 1
+        self.status_label.setText(
+            f"{filtered_count} files found (out of {len(self.all_items_data)} total)")
+
+    def handle_accept(self):
+        for item in self.file_list.selectedItems():
+            self.selected_files.append(item.data(Qt.UserRole))
+        self.accept()
+
+# ==================== Multipliers Dialog ====================
+class MultipliersDialog(QDialog):
+    def __init__(self, files, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Set Multipliers for Summed State")
+        self.setMinimumWidth(500)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f9fafb;
+            }
+            QLabel {
+                font-size: 12px;
+            }
+            QDoubleSpinBox {
+                padding: 6px;
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel("Configure Summed State")
+        header.setStyleSheet("font-weight: bold; font-size: 14px; color: #1f2937; padding: 5px;")
+        header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header)
+        layout.addWidget(QLabel("<i>Define coefficients for linear combination of states:</i>"))
+
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
+        form.setVerticalSpacing(12)
+
+        self.inputs = []
+        for f in files:
+            name = os.path.basename(f)
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            spin = QDoubleSpinBox()
+            spin.setRange(0.01, 100.0)
+            spin.setValue(1.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.5)
+
+            label = QLabel(f"× {name[:40]}{'...' if len(name) > 40 else ''}")
+            label.setToolTip(f)
+
+            row_layout.addWidget(spin)
+            row_layout.addWidget(label)
+            row_layout.addStretch()
+            form.addRow("", row_widget)
+            self.inputs.append((f, spin))
+
+        layout.addWidget(form_widget)
+        layout.addStretch()
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("Apply")
+        btns.button(QDialogButtonBox.Ok).setStyleSheet(
+            "background-color: #3b82f6; color: white; padding: 8px 16px; border-radius: 6px;")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_values(self):
+        return [(path, spin.value()) for path, spin in self.inputs]
+
+# ==================== Energy Cache ====================
+_parser_cache: Dict[str, 'OrcaParser'] = {}
+_mtime_cache: Dict[str, float] = {}
+
+def get_cached_parser(file_path: str) -> 'OrcaParser':
+    """Return a cached OrcaParser, re-reading only if file has changed."""
+    try:
+        mtime = os.path.getmtime(file_path)
+    except OSError:
+        return OrcaParser(file_path)
+    if file_path in _parser_cache and _mtime_cache.get(file_path) == mtime:
+        return _parser_cache[file_path]
+    parser = OrcaParser(file_path)
+    _parser_cache[file_path] = parser
+    _mtime_cache[file_path] = mtime
+    return parser
+
+# ==================== Parser ====================
+class OrcaParser:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.filename = os.path.basename(file_path)
+        self.content = None
+        self._read_file()
+
+    def _read_file(self):
+        for encoding in ['utf-8', 'latin-1', 'cp1252']:
+            try:
+                with open(self.file_path, 'r', encoding=encoding) as f:
+                    self.content = f.read()
+                return
+            except UnicodeDecodeError:
+                continue
+        try:
+            with open(self.file_path, 'r', encoding='utf-8', errors='replace') as f:
+                self.content = f.read()
+        except Exception as e:
+            raise ValueError(f"Cannot read file {self.filename}: {e}")
+
+    def get_energy(self, energy_type="gibbs"):
+        patterns = {
+            'gibbs': r"Final Gibbs free energy\s*\.*\s*([-\d\.]+)",
+            'enthalpy': r"Total Enthalpy\s*\.*\s*([-\d\.]+)",
+            'electronic': r"FINAL SINGLE POINT ENERGY\s+([-\d\.]+)"
+        }
+        pattern = patterns.get(energy_type.lower())
+        if not pattern:
+            return None
+        matches = re.findall(pattern, self.content)
+        if matches:
+            try:
+                return float(matches[-1])
+            except ValueError:
+                return None
+        return None
+
+    def get_all_thermo(self):
+        results = {}
+        types = {
+            'Electronic': r"FINAL SINGLE POINT ENERGY\s+([-\d\.]+)",
+            'Enthalpy':   r"Total Enthalpy\s*\.*\s*([-\d\.]+)",
+            'Gibbs':      r"Final Gibbs free energy\s*\.*\s*([-\d\.]+)"
+        }
+        for k, p in types.items():
+            matches = re.findall(p, self.content)
+            results[k] = float(matches[-1]) if matches else None
+        return results
+
+# ==================== Undo Manager ====================
+class UndoManager:
+    """Snapshot-based undo/redo for the staging list."""
+    def __init__(self, max_depth=50):
+        self._undo_stack: List[Any] = []
+        self._redo_stack: List[Any] = []
+        self._max = max_depth
+
+    def push(self, staging_list: List['PlotItem']):
+        """Save a deep copy of the current state before mutation."""
+        self._undo_stack.append(copy.deepcopy(staging_list))
+        if len(self._undo_stack) > self._max:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def undo(self, current: List['PlotItem']) -> Optional[List['PlotItem']]:
+        if not self._undo_stack:
+            return None
+        self._redo_stack.append(copy.deepcopy(current))
+        return self._undo_stack.pop()
+
+    def redo(self, current: List['PlotItem']) -> Optional[List['PlotItem']]:
+        if not self._redo_stack:
+            return None
+        self._undo_stack.append(copy.deepcopy(current))
+        return self._redo_stack.pop()
+
+    def can_undo(self) -> bool:
+        return len(self._undo_stack) > 0
+
+    def can_redo(self) -> bool:
+        return len(self._redo_stack) > 0
+
+# ==================== Threading Workers ====================
+class FolderLoader(QThread):
+    finished = Signal(dict)
+    error = Signal(str)
+    progress = Signal(int)
+    files_found = Signal(int)
+
+    def __init__(self, folder_path):
+        super().__init__()
+        self.folder_path = folder_path
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            all_files = []
+            total_found = 0
+            for root_dir, _, filenames in os.walk(self.folder_path):
+                if self._stop:
+                    return
+                out_files = [f for f in filenames if f.lower().endswith('.out')]
+                if out_files:
+                    for f in out_files:
+                        full_path = os.path.join(root_dir, f)
+                        all_files.append(full_path)
+                        total_found += 1
+                        self.files_found.emit(total_found)
+
+            if self._stop:
+                return
+
+            total = len(all_files)
+            if total == 0:
+                self.finished.emit({'path': self.folder_path, 'files': []})
+                return
+
+            files = []
+            for i, full_path in enumerate(all_files):
+                if self._stop:
+                    return
+                rel_path = os.path.relpath(full_path, self.folder_path)
+                files.append((rel_path, full_path))
+                self.progress.emit(i + 1)
+
+            files.sort(key=lambda x: [
+                int(c) if c.isdigit() else c.lower()
+                for c in re.split('([0-9]+)', x[0])
+            ])
+
+            self.finished.emit({'path': self.folder_path, 'files': files})
+        except Exception as e:
+            self.error.emit(str(e))
+
+# ==================== Main UI ====================
+_LINESTYLE_MAP = {
+    'Solid (-)': '-',
+    'Dashed (--)': '--',
+    'Dotted (:)': ':',
+    'Dash-dot (-.)': '-.',
+}
+
+class OrcaAnalyzerApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ORCA Professional Plotter v5.0 - Publication High-Res Suite")
+        self.resize(1800, 1050)
+        QImageReader.setAllocationLimit(2048)
+        self.setWindowIcon(QIcon())
+
+        self.folders: Dict[str, Dict] = {}
+        self.plot_staging_list: List[PlotItem] = []
+        self.color_cycle = cycle([
+            '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6',
+            '#ec489a', '#06b6d4', '#6b7280', '#84cc16', '#f97316'
+        ])
+
+        self.dragging_idx = None
+        self.dragging_type = None
+        self.pick_threshold = 0.2
+        self.selected_states = set()
+        self.undo_mgr = UndoManager(max_depth=50)
+        self._dirty = False
+        self._drag_artists = {}  # cache for drag performance
+
+        self.setup_ui()
+        self.setup_menu()
+        self.setup_toolbar()
+        self.statusBar().showMessage("Ready | 1200 DPI Clipboard Active | Professional Mode")
+
+    # ------------------------------------------------------------------
+    def setup_ui(self):
+        central_widget = QWidget()
+        central_widget.setStyleSheet("QWidget { background-color: #f0f0f0; color: #111111; }")
+        self.setCentralWidget(central_widget)
+
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.setHandleWidth(4)
+        self.splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #e5e7eb;
+                border: none;
+                border-radius: 2px;
+            }
+            QSplitter::handle:hover {
+                background-color: #9ca3af;
+            }
+        """)
+        main_layout.addWidget(self.splitter)
+
+        # Control panel
+        self.control_panel = QWidget()
+        self.control_panel.setMinimumWidth(400)
+        self.control_panel.setMaximumWidth(480)
+        control_layout = QVBoxLayout(self.control_panel)
+        control_layout.setContentsMargins(8, 8, 8, 8)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                border: none;
+                background-color: #f3f4f6;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #9ca3af;
+                border-radius: 6px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #6b7280;
+            }
+        """)
+
+        scroll_content = QWidget()
+        self.sidebar_layout = QVBoxLayout(scroll_content)
+        self.sidebar_layout.setSpacing(16)
+        scroll.setWidget(scroll_content)
+        control_layout.addWidget(scroll)
+        self.splitter.addWidget(self.control_panel)
+
+        # Header
+        header_widget = QWidget()
+        header_layout = QVBoxLayout(header_widget)
+        header_label = QLabel("ORCA Energy Plotter")
+        header_label.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                padding: 12px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #1e3a8a, stop:1 #1e40af);
+                color: #ffffff;
+                border-radius: 12px;
+            }
+        """)
+        header_label.setAlignment(Qt.AlignCenter)
+        header_layout.addWidget(header_label)
+        self.sidebar_layout.addWidget(header_widget)
+
+        # Folder & Explorer
+        folder_mgmt_group = ModernGroupBox("📁 Data Input & Explorer")
+        folder_mgmt_lay = QVBoxLayout(folder_mgmt_group)
+
+        btn_add_folder = GradientButton("Add Folder...", color1="#10b981", color2="#059669")
+        btn_add_folder.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        btn_add_folder.setToolTip("Select a folder containing ORCA .out files. The folder will be scanned recursively.")
+        btn_add_folder.clicked.connect(self.add_folder_dialog)
+
+        self.btn_browse_all = GradientButton("🌐 Global File Explorer", color1="#06b6d4", color2="#0891b2")
+        self.btn_browse_all.setIcon(self.style().standardIcon(QStyle.SP_FileDialogListView))
+        self.btn_browse_all.setToolTip("Open a window showing all .out files from all loaded folders.")
+        self.btn_browse_all.clicked.connect(self.open_global_browser)
+
+        folder_mgmt_lay.addWidget(btn_add_folder)
+        folder_mgmt_lay.addWidget(self.btn_browse_all)
+        self.sidebar_layout.addWidget(folder_mgmt_group)
+
+        # Folder tabs
+        self.tab_folders = QTabWidget()
+        self.tab_folders.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+                background-color: white;
+            }
+            QTabBar::tab {
+                background-color: #f3f4f6;
+                border: 1px solid #e5e7eb;
+                padding: 8px 16px;
+                margin-right: 4px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                font-size: 12px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                border-bottom-color: white;
+            }
+            QTabBar::tab:hover {
+                background-color: #e5e7eb;
+            }
+        """)
+        self.sidebar_layout.addWidget(self.tab_folders)
+
+        # Staging
+        stage_group = ModernGroupBox("📊 Plot Staging & Order")
+        stage_layout = QVBoxLayout(stage_group)
+
+        search_lay = QHBoxLayout()
+        self.staging_search = QLineEdit()
+        self.staging_search.setPlaceholderText("Search states...")
+        self.staging_search.setToolTip("Filter the staging list by state name.")
+        self.staging_search.textChanged.connect(self.filter_staging_list)
+        search_lay.addWidget(QLabel("🔍"))
+        search_lay.addWidget(self.staging_search)
+        stage_layout.addLayout(search_lay)
+
+        self.staging_list = StyledListWidget()
+        self.staging_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.staging_list.itemSelectionChanged.connect(self.on_staging_selection_changed)
+        self.staging_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.staging_list.customContextMenuRequested.connect(self.show_staging_context_menu)
+        self.staging_list.itemDoubleClicked.connect(lambda: self.open_label_editor())
+        stage_layout.addWidget(self.staging_list)
+
+        edit_layout = QHBoxLayout()
+        self.rename_input = QLineEdit()
+        self.rename_input.setPlaceholderText("Set label...")
+        self.rename_input.setToolTip("Enter a custom name for the selected state, then click Rename.")
+        self.rename_input.setStyleSheet("padding: 8px; border: 1px solid #d1d5db; border-radius: 6px;")
+
+        btn_rename = QPushButton("Rename")
+        btn_rename.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        btn_rename.setToolTip("Rename the selected state.")
+        btn_rename.clicked.connect(self.rename_selected_state)
+
+        btn_color = QPushButton("Color")
+        btn_color.setIcon(self.style().standardIcon(QStyle.SP_FileDialogContentsView))
+        btn_color.setToolTip("Change the color of the selected state.")
+        btn_color.clicked.connect(self.color_selected_state)
+
+        btn_advanced = QPushButton("Advanced...")
+        btn_advanced.setIcon(self.style().standardIcon(QStyle.SP_FileDialogInfoView))
+        btn_advanced.setToolTip("Open the label editor for fine control over font, color, and position.")
+        btn_advanced.clicked.connect(self.open_label_editor)
+
+        edit_layout.addWidget(self.rename_input)
+        edit_layout.addWidget(btn_rename)
+        edit_layout.addWidget(btn_color)
+        edit_layout.addWidget(btn_advanced)
+        stage_layout.addLayout(edit_layout)
+
+        stage_btns = QHBoxLayout()
+        btn_up = QPushButton("↑ Move Up")
+        btn_up.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp))
+        btn_up.setToolTip("Move the selected state up in the order.")
+        btn_up.clicked.connect(lambda: self.move_staging_item(-1))
+
+        btn_down = QPushButton("↓ Move Down")
+        btn_down.setIcon(self.style().standardIcon(QStyle.SP_ArrowDown))
+        btn_down.setToolTip("Move the selected state down in the order.")
+        btn_down.clicked.connect(lambda: self.move_staging_item(1))
+
+        btn_remove = QPushButton("Remove")
+        btn_remove.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+        btn_remove.setToolTip("Remove selected states from staging.")
+        btn_remove.clicked.connect(self.remove_staged_items)
+
+        btn_clear = QPushButton("Clear All")
+        btn_clear.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
+        btn_clear.setToolTip("Remove all states from staging.")
+        btn_clear.clicked.connect(self.clear_staging)
+
+        for b in [btn_up, btn_down, btn_remove, btn_clear]:
+            b.setMinimumHeight(36)
+            stage_btns.addWidget(b)
+        stage_layout.addLayout(stage_btns)
+
+        act_layout = QHBoxLayout()
+        btn_plot = GradientButton("📈 Update Profile", color1="#10b981", color2="#059669")
+        btn_plot.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        btn_plot.setToolTip("Generate the energy profile plot.")
+        btn_plot.clicked.connect(self.update_plot)
+
+        btn_clipboard = GradientButton("📋 Copy 1200 DPI", color1="#6b7280", color2="#4b5563")
+        btn_clipboard.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        btn_clipboard.setToolTip("Copy a high-resolution (1200 DPI) image of the plot to the clipboard.")
+        btn_clipboard.clicked.connect(self.copy_to_clipboard)
+
+        act_layout.addWidget(btn_plot)
+        act_layout.addWidget(btn_clipboard)
+        stage_layout.addLayout(act_layout)
+        self.sidebar_layout.addWidget(stage_group)
+
+        # Journal presets
+        journal_group = ModernGroupBox("🎯 Publication Quality Presets")
+        journal_layout = QVBoxLayout(journal_group)
+
+        self.journal_preset_combo = QComboBox()
+        self.journal_preset_combo.addItems([
+            "Custom", "JACS (Single Column)", "JACS (Double Column)",
+            "Nature/Science", "Angewandte", "ACS Catalysis"
+        ])
+        self.journal_preset_combo.setToolTip("Apply journal-specific formatting presets.")
+        self.journal_preset_combo.currentIndexChanged.connect(self.apply_journal_preset)
+        journal_layout.addWidget(self.journal_preset_combo)
+
+        style_btns = QHBoxLayout()
+        for style_name, colors in [
+            ("Light",    ("#8b5cf6", "#6d28d9")),
+            ("Dark",     ("#1f2937", "#111827")),
+            ("Colorful", ("#ec489a", "#db2777")),
+        ]:
+            btn = QPushButton(style_name)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {colors[0]};
+                    color: white;
+                    border: none;
+                    padding: 8px;
+                    border-radius: 8px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: {colors[1]};
+                }}
+            """)
+            btn.clicked.connect(lambda checked, s=style_name: self.apply_quick_style(s))
+            style_btns.addWidget(btn)
+        journal_layout.addLayout(style_btns)
+        self.sidebar_layout.addWidget(journal_group)
+
+        # Legend & labelling
+        legend_group = ModernGroupBox("🏷️ Legend & Labeling")
+        legend_form = QFormLayout(legend_group)
+        legend_form.setVerticalSpacing(10)
+
+        interactive_lay = QHBoxLayout()
+        self.check_interactive = QCheckBox("Enable Dragging")
+        self.check_interactive.setChecked(True)
+        self.check_interactive.setToolTip("Allow dragging labels and states directly on the plot.")
+        self.btn_reset_labels = QPushButton("Reset Positions")
+        self.btn_reset_labels.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.btn_reset_labels.setToolTip("Reset all label positions to default.")
+        self.btn_reset_labels.clicked.connect(self.reset_all_labels)
+        interactive_lay.addWidget(self.check_interactive)
+        interactive_lay.addWidget(self.btn_reset_labels)
+        legend_form.addRow(interactive_lay)
+
+        self.check_show_legend = QCheckBox("Display Legend")
+        self.check_show_legend.setChecked(True)
+        self.check_show_legend.setToolTip("Show/hide the plot legend.")
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems([
+            "Default", "ggplot", "seaborn-v0_8", "bmh",
+            "dark_background", "Solarize_Light2"
+        ])
+        self.theme_combo.setToolTip("Matplotlib style theme.")
+
+        self.legend_loc_combo = QComboBox()
+        self.legend_loc_combo.addItems([
+            "best", "upper right", "upper left", "lower left",
+            "lower right", "right", "center left", "center"
+        ])
+        self.legend_loc_combo.setToolTip("Legend placement on the plot.")
+
+        self.line_style_combo = QComboBox()
+        self.line_style_combo.addItems([
+            "Solid (-)", "Dashed (--)", "Dotted (:)", "Dash-dot (-.)"
+        ])
+        self.line_style_combo.setToolTip("Line style for connecting state bars.")
+
+        font_group = QGroupBox("Font Settings")
+        font_layout = QFormLayout(font_group)
+
+        self.base_fs_spin = QSpinBox()
+        self.base_fs_spin.setRange(4, 30)
+        self.base_fs_spin.setValue(10)
+        self.base_fs_spin.setToolTip("Base font size for axis labels and titles.")
+
+        self.tick_fs_spin = QSpinBox()
+        self.tick_fs_spin.setRange(4, 30)
+        self.tick_fs_spin.setValue(10)
+        self.tick_fs_spin.setToolTip("Font size for tick labels.")
+        self.check_tick_bold = QCheckBox("Bold State Names")
+
+        self.energy_fs_spin = QSpinBox()
+        self.energy_fs_spin.setRange(4, 30)
+        self.energy_fs_spin.setValue(9)
+        self.energy_fs_spin.setToolTip("Font size for energy values.")
+        self.check_energy_bold = QCheckBox("Bold Energy Labels")
+        self.check_energy_bold.setChecked(True)
+
+        self.delta_fs_spin = QSpinBox()
+        self.delta_fs_spin.setRange(4, 30)
+        self.delta_fs_spin.setValue(8)
+        self.delta_fs_spin.setToolTip("Font size for Δ labels.")
+        self.check_delta_bold = QCheckBox("Bold Delta Labels")
+        self.check_delta_bold.setChecked(True)
+
+        font_layout.addRow("Base Font Size:", self.base_fs_spin)
+        font_layout.addRow("Tick Size:", self.tick_fs_spin)
+        font_layout.addRow("", self.check_tick_bold)
+        font_layout.addRow("Energy Size:", self.energy_fs_spin)
+        font_layout.addRow("", self.check_energy_bold)
+        font_layout.addRow("Delta Size:", self.delta_fs_spin)
+        font_layout.addRow("", self.check_delta_bold)
+
+        self.check_pub_quality = QCheckBox("Publication Style (Serif Font)")
+        self.check_pub_quality.setToolTip("Use Times New Roman font for a classic journal appearance.")
+        self.check_show_e_labels = QCheckBox("Show Energy Values")
+        self.check_show_e_labels.setChecked(True)
+        self.check_show_delta = QCheckBox("Show Δ Values")
+        self.check_show_delta.setChecked(True)
+        self.check_auto_align = QCheckBox("Auto-align Labels")
+        self.check_auto_align.setChecked(True)
+
+        legend_form.addRow(self.check_show_legend)
+        legend_form.addRow("Theme:", self.theme_combo)
+        legend_form.addRow("Legend Pos:", self.legend_loc_combo)
+        legend_form.addRow("Line Style:", self.line_style_combo)
+        legend_form.addRow(font_group)
+        legend_form.addRow(self.check_pub_quality)
+        legend_form.addRow(self.check_show_e_labels)
+        legend_form.addRow(self.check_show_delta)
+        legend_form.addRow(self.check_auto_align)
+
+        for w in [self.check_show_legend, self.check_tick_bold,
+                  self.check_energy_bold, self.check_delta_bold,
+                  self.check_pub_quality, self.check_show_e_labels,
+                  self.check_show_delta, self.check_interactive,
+                  self.check_auto_align]:
+            w.stateChanged.connect(self.update_plot)
+        for w in [self.theme_combo, self.legend_loc_combo, self.line_style_combo]:
+            w.currentIndexChanged.connect(self.update_plot)
+        for w in [self.base_fs_spin, self.tick_fs_spin,
+                  self.energy_fs_spin, self.delta_fs_spin]:
+            w.valueChanged.connect(self.update_plot)
+
+        self.sidebar_layout.addWidget(legend_group)
+
+        # Layout & Canvas
+        box_group = ModernGroupBox("📐 Layout & Canvas")
+        box_form = QFormLayout(box_group)
+        box_form.setVerticalSpacing(10)
+
+        self.fig_width_spin = QDoubleSpinBox()
+        self.fig_width_spin.setRange(2, 25)
+        self.fig_width_spin.setValue(10)
+        self.fig_width_spin.setSingleStep(0.5)
+        self.fig_width_spin.setToolTip("Figure width in inches.")
+
+        self.fig_height_spin = QDoubleSpinBox()
+        self.fig_height_spin.setRange(2, 20)
+        self.fig_height_spin.setValue(7)
+        self.fig_height_spin.setSingleStep(0.5)
+        self.fig_height_spin.setToolTip("Figure height in inches.")
+
+        self.state_width_slider = QDoubleSpinBox()
+        self.state_width_slider.setRange(0.1, 0.9)
+        self.state_width_slider.setValue(0.6)
+        self.state_width_slider.setSingleStep(0.05)
+        self.state_width_slider.setToolTip("Width of the state bars (fraction of spacing).")
+
+        self.bar_thickness_spin = QDoubleSpinBox()
+        self.bar_thickness_spin.setRange(0.5, 15.0)
+        self.bar_thickness_spin.setValue(3.5)
+        self.bar_thickness_spin.setSingleStep(0.5)
+        self.bar_thickness_spin.setToolTip("Thickness of the state bars (points).")
+
+        self.margin_left_spin = QDoubleSpinBox()
+        self.margin_left_spin.setRange(0.01, 0.4)
+        self.margin_left_spin.setValue(0.12)
+        self.margin_left_spin.setSingleStep(0.01)
+        self.margin_left_spin.setToolTip("Left margin of the figure (fraction of width).")
+
+        visual_lay1 = QHBoxLayout()
+        visual_lay2 = QHBoxLayout()
+
+        self.check_show_xaxis = QCheckBox("X-Axis")
+        self.check_show_xaxis.setChecked(True)
+        self.check_show_yaxis = QCheckBox("Y-Axis")
+        self.check_show_yaxis.setChecked(True)
+        self.check_show_frame = QCheckBox("Frame")
+        self.check_show_frame.setChecked(True)
+        self.check_inward_ticks = QCheckBox("Inward Ticks")
+        self.check_inward_ticks.setChecked(True)
+        self.check_grid = QCheckBox("Grid")
+        self.check_grid.setChecked(True)
+        self.check_smooth = QCheckBox("Smooth Lines")
+        self.check_smooth.setChecked(True)
+        self.check_overlay = QCheckBox("Overlay")
+        self.check_overlay.setChecked(True)
+        self.check_shadow = QCheckBox("Shadows")
+
+        visual_lay1.addWidget(self.check_show_xaxis)
+        visual_lay1.addWidget(self.check_show_yaxis)
+        visual_lay1.addWidget(self.check_show_frame)
+        visual_lay2.addWidget(self.check_inward_ticks)
+        visual_lay2.addWidget(self.check_grid)
+        visual_lay2.addWidget(self.check_smooth)
+        visual_lay2.addWidget(self.check_overlay)
+        visual_lay2.addWidget(self.check_shadow)
+
+        box_form.addRow("Width / Height (in):", self.fig_width_spin)
+        box_form.addRow("", self.fig_height_spin)
+        box_form.addRow("State Bar Width:", self.state_width_slider)
+        box_form.addRow("Bar Thickness (pt):", self.bar_thickness_spin)
+        box_form.addRow("Left Margin:", self.margin_left_spin)
+        box_form.addRow(visual_lay1)
+        box_form.addRow(visual_lay2)
+
+        for w in [self.check_show_xaxis, self.check_show_yaxis,
+                  self.check_show_frame, self.check_inward_ticks,
+                  self.check_grid, self.check_smooth,
+                  self.check_overlay, self.check_shadow]:
+            w.stateChanged.connect(self.update_plot)
+        for w in [self.fig_width_spin, self.fig_height_spin,
+                  self.state_width_slider, self.bar_thickness_spin,
+                  self.margin_left_spin]:
+            w.valueChanged.connect(self.update_plot)
+
+        self.sidebar_layout.addWidget(box_group)
+
+        # Axis & Reference
+        config_group = ModernGroupBox("📊 Axis & Reference")
+        config_form = QFormLayout(config_group)
+        config_form.setVerticalSpacing(10)
+
+        self.title_input = QLineEdit("Reaction Energy Profile")
+        self.title_input.setToolTip("Plot title (leave empty for no title).")
+        self.title_input.setStyleSheet("padding: 8px; border: 1px solid #d1d5db; border-radius: 6px;")
+
+        self.y_label_input = QLineEdit("Relative Energy (kcal/mol)")
+        self.y_label_input.setToolTip("Y-axis label (automatically updates with units).")
+        self.y_label_input.setStyleSheet("padding: 8px; border: 1px solid #d1d5db; border-radius: 6px;")
+
+        self.energy_type_combo = QComboBox()
+        self.energy_type_combo.addItems(["Gibbs", "Enthalpy", "Electronic"])
+        self.energy_type_combo.setToolTip("Which energy type to extract from .out files.")
+
+        self.zero_ref_combo = QComboBox()
+        self.zero_ref_combo.addItem("Minimum (Global)")
+        self.zero_ref_combo.addItem("Per Pathway (First State)")
+        self.zero_ref_combo.setToolTip("Reference for relative energies.\n- Minimum (Global): lowest energy across all states\n- Per Pathway (First State): each folder's first state is set to zero")
+        self.zero_ref_combo.currentIndexChanged.connect(self.update_plot)
+
+        unit_lay = QHBoxLayout()
+        self.btn_kcal = QPushButton("kcal/mol")
+        self.btn_kj = QPushButton("kJ/mol")
+        self.btn_ev = QPushButton("eV")
+        self.btn_kcal.setCheckable(True)
+        self.btn_kj.setCheckable(True)
+        self.btn_ev.setCheckable(True)
+        self.btn_kcal.setChecked(True)
+        for btn in [self.btn_kcal, self.btn_kj, self.btn_ev]:
+            btn.setMinimumHeight(32)
+            btn.clicked.connect(self.update_energy_units)
+            unit_lay.addWidget(btn)
+
+        config_form.addRow("Title:", self.title_input)
+        config_form.addRow("Y-Axis Label:", self.y_label_input)
+        config_form.addRow("Energy Source:", self.energy_type_combo)
+        config_form.addRow("Zero Reference:", self.zero_ref_combo)
+        config_form.addRow("Units:", unit_lay)
+
+        self.title_input.textChanged.connect(self.update_plot)
+        self.y_label_input.textChanged.connect(self.update_plot)
+        self.energy_type_combo.currentIndexChanged.connect(self.update_plot)
+
+        self.sidebar_layout.addWidget(config_group)
+        self.sidebar_layout.addStretch()
+
+        # Main view tabs
+        self.main_view_tabs = QTabWidget()
+        self.main_view_tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 2px solid #e5e7eb;
+                border-radius: 12px;
+                background-color: white;
+                padding: 8px;
+            }
+            QTabBar::tab {
+                background-color: #f3f4f6;
+                border: 1px solid #e5e7eb;
+                padding: 10px 20px;
+                margin-right: 4px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                border-bottom-color: white;
+                color: #3b82f6;
+            }
+            QTabBar::tab:hover {
+                background-color: #e5e7eb;
+            }
+        """)
+
+        # Plot tab
+        self.plot_tab = QWidget()
+        plot_tab_layout = QVBoxLayout(self.plot_tab)
+        plot_tab_layout.setContentsMargins(8, 8, 8, 8)
+
+        plot_header = QLabel("Publication-Ready Energy Profile")
+        plot_header.setStyleSheet("font-size: 16px; font-weight: bold; color: #000000; padding: 8px;")
+        plot_header.setAlignment(Qt.AlignCenter)
+        plot_tab_layout.addWidget(plot_header)
+
+        canvas_frame = QFrame()
+        canvas_frame.setFrameStyle(QFrame.Box | QFrame.Raised)
+        canvas_frame.setStyleSheet("border: 2px solid #e5e7eb; border-radius: 8px; background-color: white;")
+        canvas_layout = QVBoxLayout(canvas_frame)
+
+        self.fig = Figure(figsize=(10, 7), dpi=100, facecolor='white')
+        self.canvas = FigureCanvas(self.fig)
+        self.ax = self.fig.add_subplot(111)
+
+        self.toolbar = NavigationToolbar(self.canvas, None)
+        canvas_layout.addWidget(self.canvas)
+        canvas_layout.addWidget(self.toolbar)
+        plot_tab_layout.addWidget(canvas_frame)
+        self.main_view_tabs.addTab(self.plot_tab, "📈 Publication Plot")
+
+        # Data table tab
+        self.data_tab = QWidget()
+        data_tab_layout = QVBoxLayout(self.data_tab)
+        data_tab_layout.setContentsMargins(8, 8, 8, 8)
+
+        data_header = QLabel("Thermodynamic Data Projection")
+        data_header.setStyleSheet("font-size: 16px; font-weight: bold; color: #000000; padding: 8px;")
+        data_header.setAlignment(Qt.AlignCenter)
+        data_tab_layout.addWidget(data_header)
+
+        self.data_table = QTableWidget()
+        self.data_table.setColumnCount(7)
+        self.data_table.setHorizontalHeaderLabels([
+            "Label", "Electronic (Eh)", "Enthalpy (Eh)", "Gibbs (Eh)",
+            "Rel. Energy", "Files", "Color"
+        ])
+        self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.data_table.setAlternatingRowColors(True)
+        self.data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.data_table.setStyleSheet("""
+            QTableWidget {
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+                background-color: white;
+                gridline-color: #e5e7eb;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #f3f4f6;
+                padding: 8px;
+                border: 1px solid #e5e7eb;
+                font-weight: bold;
+            }
+            QTableWidget::item {
+                padding: 6px;
+            }
+            QTableWidget::item:selected {
+                background-color: #3b82f6;
+                color: white;
+            }
+        """)
+
+        table_act_lay = QHBoxLayout()
+        self.btn_move_table_up = QPushButton("↑ Move Up")
+        self.btn_move_table_up.setIcon(self.style().standardIcon(QStyle.SP_ArrowUp))
+        self.btn_move_table_up.clicked.connect(lambda: self.move_table_item(-1))
+
+        self.btn_move_table_down = QPushButton("↓ Move Down")
+        self.btn_move_table_down.setIcon(self.style().standardIcon(QStyle.SP_ArrowDown))
+        self.btn_move_table_down.clicked.connect(lambda: self.move_table_item(1))
+
+        self.btn_delete_row = QPushButton("Delete Row(s)")
+        self.btn_delete_row.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+        self.btn_delete_row.clicked.connect(self.remove_table_items)
+
+        self.btn_export_csv = QPushButton("Export CSV")
+        self.btn_export_csv.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        self.btn_export_csv.clicked.connect(self.export_csv)
+
+        for btn in [self.btn_move_table_up, self.btn_move_table_down,
+                    self.btn_delete_row, self.btn_export_csv]:
+            btn.setMinimumHeight(32)
+            table_act_lay.addWidget(btn)
+        table_act_lay.addStretch()
+
+        data_tab_layout.addWidget(self.data_table)
+        data_tab_layout.addLayout(table_act_lay)
+        self.main_view_tabs.addTab(self.data_tab, "📋 Thermodynamic Table")
+
+        # Connect mouse events
+        self.canvas.mpl_connect('button_press_event', self.on_press)
+        self.canvas.mpl_connect('motion_notify_event', self.on_motion)
+        self.canvas.mpl_connect('button_release_event', self.on_release)
+        self.canvas.mpl_connect('pick_event', self.on_pick)
+
+        self.splitter.addWidget(self.main_view_tabs)
+        self.splitter.setStretchFactor(1, 4)
+        self.splitter.setSizes([400, 1400])
+
+    # ------------------------------------------------------------------
+    def setup_toolbar(self):
+        toolbar = QToolBar("Main Toolbar")
+        toolbar.setMovable(False)
+        toolbar.setIconSize(QSize(28, 28))
+        self.addToolBar(toolbar)
+
+        for label, slot in [
+            ("New Session",     self.new_session),
+            ("Load Session",    self.load_session),
+            ("Save Session",    self.save_session),
+        ]:
+            act = QAction(label, self)
+            act.triggered.connect(slot)
+            toolbar.addAction(act)
+
+        toolbar.addSeparator()
+
+        for label, slot in [
+            ("Update Plot",     self.update_plot),
+            ("Copy 1200 DPI",   self.copy_to_clipboard),
+            ("Export Graphic",  self.export_image),
+        ]:
+            act = QAction(label, self)
+            act.triggered.connect(slot)
+            toolbar.addAction(act)
+
+        toolbar.addSeparator()
+
+        for label, slot in [
+            ("Align Labels",    self.auto_align_labels),
+            ("Reset Positions", self.reset_all_labels),
+        ]:
+            act = QAction(label, self)
+            act.triggered.connect(slot)
+            toolbar.addAction(act)
+
+        toolbar.addSeparator()
+
+        dark_act = QAction("Dark Theme", self)
+        dark_act.triggered.connect(lambda: self.apply_quick_style("Dark"))
+        toolbar.addAction(dark_act)
+
+        light_act = QAction("Light Theme", self)
+        light_act.triggered.connect(lambda: self.apply_quick_style("Light"))
+        toolbar.addAction(light_act)
+
+    # ------------------------------------------------------------------
+    def setup_menu(self):
+        menubar = self.menuBar()
+        menubar.setStyleSheet("QMenuBar { background-color: #f9fafb; }")
+
+        file_menu = menubar.addMenu("&File")
+        for label, shortcut, slot in [
+            ("&New Session",    QKeySequence.New,  self.new_session),
+            ("&Load Session...",QKeySequence.Open, self.load_session),
+            ("&Save Session...",QKeySequence.Save, self.save_session),
+        ]:
+            act = QAction(label, self)
+            act.setShortcut(shortcut)
+            act.triggered.connect(slot)
+            file_menu.addAction(act)
+
+        file_menu.addSeparator()
+        import_act = QAction("&Import Data...", self)
+        import_act.triggered.connect(self.import_data)
+        file_menu.addAction(import_act)
+
+        export_act = QAction("&Export Data...", self)
+        export_act.triggered.connect(self.export_csv)
+        file_menu.addAction(export_act)
+
+        file_menu.addSeparator()
+        export_img_act = QAction("Export &Graphic...", self)
+        export_img_act.triggered.connect(self.export_image)
+        file_menu.addAction(export_img_act)
+
+        copy_act = QAction("&Copy 1200 DPI", self)
+        copy_act.triggered.connect(self.copy_to_clipboard)
+        copy_act.setShortcut("Ctrl+Shift+C")
+        file_menu.addAction(copy_act)
+
+        file_menu.addSeparator()
+        exit_act = QAction("E&xit", self)
+        exit_act.triggered.connect(self.close)
+        exit_act.setShortcut(QKeySequence.Quit)
+        file_menu.addAction(exit_act)
+
+        edit_menu = menubar.addMenu("&Edit")
+
+        undo_act = QAction("&Undo", self)
+        undo_act.setShortcut(QKeySequence.Undo)
+        undo_act.triggered.connect(self.perform_undo)
+        edit_menu.addAction(undo_act)
+
+        redo_act = QAction("&Redo", self)
+        redo_act.setShortcut(QKeySequence.Redo)
+        redo_act.triggered.connect(self.perform_redo)
+        edit_menu.addAction(redo_act)
+        edit_menu.addSeparator()
+
+        select_all_act = QAction("Select &All", self)
+        select_all_act.setShortcut(QKeySequence.SelectAll)
+        select_all_act.triggered.connect(self.select_all_states)
+        edit_menu.addAction(select_all_act)
+        edit_menu.addSeparator()
+
+        align_act = QAction("&Align Labels", self)
+        align_act.triggered.connect(self.auto_align_labels)
+        edit_menu.addAction(align_act)
+
+        reset_act = QAction("&Reset Positions", self)
+        reset_act.triggered.connect(self.reset_all_labels)
+        edit_menu.addAction(reset_act)
+
+        view_menu = menubar.addMenu("&View")
+        for label, style in [
+            ("&Dark Theme",     "Dark"),
+            ("&Light Theme",    "Light"),
+            ("&Colorful Theme", "Colorful"),
+        ]:
+            act = QAction(label, self)
+            act.triggered.connect(lambda checked, s=style: self.apply_quick_style(s))
+            view_menu.addAction(act)
+
+        view_menu.addSeparator()
+        toggle_sidebar_act = QAction("Toggle &Sidebar", self)
+        toggle_sidebar_act.setShortcut("Ctrl+B")
+        toggle_sidebar_act.triggered.connect(self.toggle_sidebar)
+        view_menu.addAction(toggle_sidebar_act)
+
+        help_menu = menubar.addMenu("&Help")
+        about_act = QAction("&About", self)
+        about_act.triggered.connect(self.show_about)
+        help_menu.addAction(about_act)
+
+    # ==================== Interaction ====================
+    def show_staging_context_menu(self, position):
+        menu = QMenu()
+        edit_action = menu.addAction("Edit Label Properties...")
+        edit_action.triggered.connect(self.open_label_editor)
+        duplicate_action = menu.addAction("Duplicate")
+        duplicate_action.triggered.connect(self.duplicate_selected_state)
+        menu.addSeparator()
+        move_up_action = menu.addAction("Move Up")
+        move_up_action.triggered.connect(lambda: self.move_staging_item(-1))
+        move_down_action = menu.addAction("Move Down")
+        move_down_action.triggered.connect(lambda: self.move_staging_item(1))
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove")
+        remove_action.triggered.connect(self.remove_staged_items)
+        menu.exec_(self.staging_list.viewport().mapToGlobal(position))
+
+    def open_label_editor(self):
+        row = self.staging_list.currentRow()
+        if row == -1:
+            QMessageBox.warning(self, "No Selection", "Please select a state to edit.")
+            return
+        self.undo_mgr.push(self.plot_staging_list)
+        dlg = LabelEditorDialog(self.plot_staging_list[row], self)
+        if dlg.exec():
+            values = dlg.get_values()
+            for key, value in values.items():
+                setattr(self.plot_staging_list[row], key, value)
+            self._dirty = True
+            self.sync_sidebar_list()
+            self.update_plot()
+
+    def duplicate_selected_state(self):
+        row = self.staging_list.currentRow()
+        if row == -1:
+            return
+        self.undo_mgr.push(self.plot_staging_list)
+        original = self.plot_staging_list[row]
+        duplicate = copy.deepcopy(original)
+        duplicate.custom_name = f"{duplicate.custom_name or duplicate.display_name} (copy)"
+        duplicate.label_offset = [original.label_offset[0] + 0.1, original.label_offset[1] + 0.1]
+        self.plot_staging_list.insert(row + 1, duplicate)
+        self._dirty = True
+        self.sync_sidebar_list()
+        self.update_plot()
+
+    def filter_staging_list(self):
+        query = self.staging_search.text().lower()
+        for i in range(self.staging_list.count()):
+            item = self.staging_list.item(i)
+            item.setHidden(bool(query) and query not in item.text().lower())
+
+    def on_staging_selection_changed(self):
+        self.selected_states.clear()
+        for item in self.staging_list.selectedItems():
+            row = self.staging_list.row(item)
+            if row >= 0:
+                self.selected_states.add(row)
+
+    def select_all_states(self):
+        self.staging_list.selectAll()
+
+    def toggle_sidebar(self):
+        self.control_panel.setVisible(not self.control_panel.isVisible())
+
+    def reset_all_labels(self):
+        reply = QMessageBox.question(self, "Reset Labels", "Reset all label positions to default?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.undo_mgr.push(self.plot_staging_list)
+            for it in self.plot_staging_list:
+                it.label_offset = [0.0, 0.5]
+                it.delta_offset = [0.05, 0.0]
+            self._dirty = True
+            self.update_plot()
+            self.statusBar().showMessage("All label positions reset", 3000)
+
+    def auto_align_labels(self):
+        self.undo_mgr.push(self.plot_staging_list)
+        for i, item in enumerate(self.plot_staging_list):
+            item.label_offset[0] = 0.0
+            item.label_offset[1] = 0.5 + (i % 3) * 0.3
+        self._dirty = True
+        self.update_plot()
+        self.statusBar().showMessage("Labels auto-aligned", 3000)
+
+    def perform_undo(self):
+        """Restore the previous state from the undo stack."""
+        result = self.undo_mgr.undo(self.plot_staging_list)
+        if result is not None:
+            self.plot_staging_list = result
+            self.sync_sidebar_list()
+            self.update_plot()
+            self.statusBar().showMessage("Undo", 2000)
+        else:
+            self.statusBar().showMessage("Nothing to undo", 2000)
+
+    def perform_redo(self):
+        """Re-apply the last undone action."""
+        result = self.undo_mgr.redo(self.plot_staging_list)
+        if result is not None:
+            self.plot_staging_list = result
+            self.sync_sidebar_list()
+            self.update_plot()
+            self.statusBar().showMessage("Redo", 2000)
+        else:
+            self.statusBar().showMessage("Nothing to redo", 2000)
+
+    def update_zero_reference_combo(self):
+        self.zero_ref_combo.blockSignals(True)
+        current = self.zero_ref_combo.currentText()
+        self.zero_ref_combo.clear()
+        self.zero_ref_combo.addItem("Minimum (Global)")
+        self.zero_ref_combo.addItem("Per Pathway (First State)")
+        # Also list individual states (for global reference)
+        for it in self.plot_staging_list:
+            name = it.custom_name if it.custom_name else it.display_name
+            self.zero_ref_combo.addItem(name)
+        index = self.zero_ref_combo.findText(current)
+        if index >= 0:
+            self.zero_ref_combo.setCurrentIndex(index)
+        self.zero_ref_combo.blockSignals(False)
+
+    def update_energy_units(self):
+        sender = self.sender()
+        for btn in [self.btn_kcal, self.btn_kj, self.btn_ev]:
+            btn.setChecked(btn is sender)
+        if sender == self.btn_kcal:
+            self.y_label_input.setText("Relative Energy (kcal/mol)")
+        elif sender == self.btn_kj:
+            self.y_label_input.setText("Relative Energy (kJ/mol)")
+        elif sender == self.btn_ev:
+            self.y_label_input.setText("Relative Energy (eV)")
+        self.update_plot()
+
+    def open_global_browser(self):
+        if not self.folders:
+            QMessageBox.information(self, "Empty Explorer", "Please add one or more folders first.")
+            return
+        dlg = GlobalFileBrowser(self.folders, self)
+        if dlg.exec():
+            for folder_path, full_path in dlg.selected_files:
+                folder_data = self.folders[folder_path]
+                display = f"[{os.path.basename(folder_path)}] {os.path.basename(full_path)}"
+                plot_item = PlotItem(file_data=[(full_path, 1.0)], display_name=display, folder_path=folder_path)
+                self.plot_staging_list.append(plot_item)
+                li = QListWidgetItem(display)
+                li.setForeground(QColor(folder_data['color']))
+                li.setToolTip(full_path)
+                self.staging_list.addItem(li)
+            self.statusBar().showMessage(f"Added {len(dlg.selected_files)} files to staging", 3000)
+            self.filter_staging_list()
+            self.update_plot()
+
+    # ------------------------------------------------------------------
+    def _iter_items_with_x(self):
+        is_overlay = self.check_overlay.isChecked()
+        curr_x = 0
+        for _f_path, group in groupby(enumerate(self.plot_staging_list), key=lambda x: x[1].folder_path):
+            items = list(group)
+            for i, (orig_idx, it) in enumerate(items):
+                lx = i if is_overlay else (curr_x + i)
+                yield orig_idx, it, lx
+            if not is_overlay:
+                curr_x += len(items)
+
+    # --------------------- Dragging fix --------------------------
+    def _get_display_y(self, item):
+        """Return the Y‑coordinate (in data coordinates) of the bar for a given item,
+           using the same reference method as the plot."""
+        e_type = self.energy_type_combo.currentText().lower()
+        conv = self._conv_factor()
+        ref_mode = self.zero_ref_combo.currentText()
+        val = self.calculate_state_energy(item, e_type)
+        if val is None:
+            return None
+        if ref_mode == "Per Pathway (First State)":
+            # Find the first state in this folder (by order in staging list)
+            folder = item.folder_path
+            first_val = None
+            for it in self.plot_staging_list:
+                if it.folder_path == folder:
+                    first_val = self.calculate_state_energy(it, e_type)
+                    break
+            if first_val is None:
+                return None
+            return (val - first_val) * conv
+        else:
+            global_ref = self.get_reference_energy()
+            if global_ref is None:
+                return None
+            return (val - global_ref) * conv
+
+    def on_press(self, event):
+        if not self.check_interactive.isChecked() or event.inaxes != self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        min_dist = self.pick_threshold
+        found_idx = None
+        found_type = None
+
+        for orig_idx, it, lx in self._iter_items_with_x():
+            y = self._get_display_y(it)
+            if y is None:
+                continue
+
+            dist = np.sqrt((event.xdata - (lx + it.label_offset[0])) ** 2 +
+                           (event.ydata - (y + it.label_offset[1])) ** 2)
+            if dist < min_dist:
+                min_dist = dist
+                found_idx = orig_idx
+                found_type = 'label'
+
+            if (abs(event.xdata - lx) < 0.3 and abs(event.ydata - y) < 0.5):
+                found_idx = orig_idx
+                found_type = 'state'
+
+        self.dragging_idx = found_idx
+        self.dragging_type = found_type
+        if found_idx is not None:
+            self.undo_mgr.push(self.plot_staging_list)
+            name = self.plot_staging_list[found_idx].custom_name or self.plot_staging_list[found_idx].display_name
+            self.statusBar().showMessage(f"Dragging {found_type}: {name}", 2000)
+
+    def on_motion(self, event):
+        if self.dragging_idx is None or event.inaxes != self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        it = self.plot_staging_list[self.dragging_idx]
+
+        for orig_idx, item, lx in self._iter_items_with_x():
+            if orig_idx != self.dragging_idx:
+                continue
+            y = self._get_display_y(item)
+            if y is None:
+                return
+            if self.dragging_type == 'label':
+                it.label_offset[0] = event.xdata - lx
+                it.label_offset[1] = event.ydata - y
+            elif self.dragging_type == 'state':
+                it.label_offset[0] = event.xdata - lx
+            # Use draw_idle for smoother drag (deferred redraw)
+            self.update_plot()
+            self.canvas.draw_idle()
+            return
+
+    def on_release(self, event):
+        if self.dragging_idx is not None:
+            self._dirty = True
+            self.statusBar().showMessage("Drag completed", 2000)
+        self.dragging_idx = None
+        self.dragging_type = None
+
+    def on_pick(self, event):
+        pass
+
+    # ==================== Logic ====================
+    def _conv_factor(self):
+        if self.btn_kcal.isChecked():
+            return 627.509
+        if self.btn_kj.isChecked():
+            return 2625.5
+        return 27.2114
+
+    def calculate_state_energy(self, item, energy_type):
+        """Calculate the total energy for a PlotItem using cached parsers.
+        For CSV-imported items (with item.energy set and no file_data), use the stored energy directly."""
+        # Handle CSV-imported data with direct energy values
+        if item.energy is not None and not item.file_data:
+            return item.energy
+        total = 0.0
+        for path, multiplier in item.file_data:
+            val = get_cached_parser(path).get_energy(energy_type)
+            if val is None:
+                return None
+            total += val * multiplier
+        return total
+
+    def get_reference_energy(self):
+        """Returns a single reference energy for the global reference mode.
+           For per‑pathway mode, returns None (signals that reference is computed per folder)."""
+        e_type = self.energy_type_combo.currentText().lower()
+        ref_text = self.zero_ref_combo.currentText()
+        if ref_text == "Per Pathway (First State)":
+            return None
+        if ref_text == "Minimum (Global)":
+            ens = [self.calculate_state_energy(it, e_type) for it in self.plot_staging_list]
+            valid = [e for e in ens if e is not None]
+            return np.min(valid) if valid else None
+        # Otherwise it's a specific state name
+        for it in self.plot_staging_list:
+            name = it.custom_name if it.custom_name else it.display_name
+            if name == ref_text:
+                return self.calculate_state_energy(it, e_type)
+        return None
+
+    # --------------------------------------------------------
+    # Folder loading with safe progress dialog
+    # --------------------------------------------------------
+    def add_folder_dialog(self):
+        path = QFileDialog.getExistingDirectory(self, "Select ORCA Results Folder")
+        if not path or path in self.folders:
+            return
+
+        progress = QProgressDialog("Scanning folder...", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Loading Folder")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setLabelText("Scanning folder... (0 files found)")
+        progress.show()
+
+        loader = FolderLoader(path)
+
+        # Connect signals
+        loader.files_found.connect(lambda count: progress.setLabelText(
+            f"Scanning folder... ({count} files found)"))
+        loader.finished.connect(lambda data: self._on_folder_loaded(data, progress, loader))
+        loader.error.connect(lambda msg: self._on_folder_error(msg, progress, loader))
+
+        def on_cancel():
+            loader.stop()
+            progress.close()
+        progress.canceled.connect(on_cancel)
+
+        # Clean up loader when done
+        loader.finished.connect(loader.deleteLater)
+        loader.error.connect(loader.deleteLater)
+
+        loader.start()
+
+    def _on_folder_loaded(self, data, progress, loader):
+        progress.close()
+        self.on_folder_loaded(data)
+
+    def _on_folder_error(self, msg, progress, loader):
+        progress.close()
+        QMessageBox.critical(self, "Error", f"Failed to load folder: {msg}")
+
+    def on_folder_loaded(self, data):
+        path = data['path']
+        name = os.path.basename(path)
+        color = next(self.color_cycle)
+
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
+        search_lay = QHBoxLayout()
+        search_edit = QLineEdit()
+        search_edit.setPlaceholderText("Search in this folder...")
+        search_lay.addWidget(QLabel("🔍"))
+        search_lay.addWidget(search_edit)
+        tab_layout.addLayout(search_lay)
+
+        lst = QListWidget()
+        lst.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        lst.setStyleSheet("""
+            QListWidget { border: 1px solid #e5e7eb; border-radius: 8px;
+                background-color: white; font-size: 12px; }
+        """)
+
+        file_items = []
+        for d, f in data['files']:
+            item = QListWidgetItem(d)
+            item.setData(Qt.UserRole, f)
+            item.setToolTip(f)
+            lst.addItem(item)
+            file_items.append((d, f, item))
+
+        def filter_files(text):
+            for _display, _full, fitem in file_items:
+                fitem.setHidden(text.lower() not in _display.lower())
+        search_edit.textChanged.connect(filter_files)
+
+        btn_lay = QHBoxLayout()
+        b_add = GradientButton("Add Selected", color1="#10b981", color2="#059669")
+        b_add.clicked.connect(lambda: self.add_to_staging(path))
+        b_sum = GradientButton("Add Summed", color1="#06b6d4", color2="#0891b2")
+        b_sum.clicked.connect(lambda: self.add_to_staging(path, combined=True))
+        btn_lay.addWidget(b_add)
+        btn_lay.addWidget(b_sum)
+
+        tab_layout.addWidget(lst)
+        tab_layout.addLayout(btn_lay)
+
+        self.tab_folders.addTab(tab, name)
+        self.folders[path] = {
+            'color': color,
+            'list_widget': lst,
+            'files': data['files'],
+            'tab': tab
+        }
+        self.statusBar().showMessage(f"Loaded folder: {name} ({len(data['files'])} files)", 3000)
+
+    def add_to_staging(self, folder_path, combined=False):
+        folder_data = self.folders[folder_path]
+        lst = folder_data['list_widget']
+        sel = lst.selectedItems()
+
+        if not sel:
+            QMessageBox.information(self, "No Selection", "Please select files to add.")
+            return
+
+        if combined:
+            paths = [i.data(Qt.UserRole) for i in sel]
+            dlg = MultipliersDialog(paths, self)
+            if dlg.exec():
+                f_data = dlg.get_values()
+                disp = " + ".join([f"{m}*{os.path.basename(p)[:8]}" for p, m in f_data])
+                self.plot_staging_list.append(PlotItem(file_data=f_data, display_name=disp, folder_path=folder_path))
+                li = QListWidgetItem(disp)
+                li.setForeground(QColor(folder_data['color']))
+                self.staging_list.addItem(li)
+        else:
+            for i in sel:
+                full = i.data(Qt.UserRole)
+                disp = f"[{os.path.basename(folder_path)}] {i.text()}"
+                self.plot_staging_list.append(PlotItem(file_data=[(full, 1.0)], display_name=disp, folder_path=folder_path))
+                li = QListWidgetItem(disp)
+                li.setForeground(QColor(folder_data['color']))
+                self.staging_list.addItem(li)
+
+        self.filter_staging_list()
+        self.update_plot()
+        self.statusBar().showMessage(f"Added {len(sel)} item(s) to staging", 3000)
+
+    # ------------------------------------------------------------------
+    def update_data_table(self):
+        self.data_table.setRowCount(len(self.plot_staging_list))
+        ref_mode = self.zero_ref_combo.currentText()
+        e_type = self.energy_type_combo.currentText().lower()
+        conv = self._conv_factor()
+
+        # If per‑pathway, we need to compute relative energies using first state of each folder
+        if ref_mode == "Per Pathway (First State)":
+            # Group by folder
+            grouped = {}
+            for it in self.plot_staging_list:
+                grouped.setdefault(it.folder_path, []).append(it)
+            # For each folder, compute reference as energy of first state (by order in staging list)
+            folder_ref = {}
+            for folder, items in grouped.items():
+                # Find the first occurrence in the original order
+                first_item = items[0]  # items are in the same order as in staging list because we appended sequentially
+                first_energy = self.calculate_state_energy(first_item, e_type)
+                folder_ref[folder] = first_energy
+        else:
+            global_ref = self.get_reference_energy()
+
+        for row, it in enumerate(self.plot_staging_list):
+            name = it.custom_name if it.custom_name else it.display_name
+
+            thermo_sums: Dict[str, Optional[float]] = {'Electronic': 0.0, 'Enthalpy': 0.0, 'Gibbs': 0.0}
+            for path, mult in it.file_data:
+                file_thermo = get_cached_parser(path).get_all_thermo()
+                for k in thermo_sums:
+                    if thermo_sums[k] is None:
+                        continue
+                    if file_thermo.get(k) is None:
+                        thermo_sums[k] = None
+                    else:
+                        thermo_sums[k] += file_thermo[k] * mult
+
+            self.data_table.setItem(row, 0, QTableWidgetItem(name))
+            for col, key in enumerate(['Electronic', 'Enthalpy', 'Gibbs'], start=1):
+                v = thermo_sums[key]
+                self.data_table.setItem(row, col, QTableWidgetItem(f"{v:.6f}" if v is not None else "N/A"))
+
+            val = self.calculate_state_energy(it, e_type)
+            if ref_mode == "Per Pathway (First State)":
+                ref = folder_ref.get(it.folder_path)
+                if ref is not None and val is not None:
+                    rel = (val - ref) * conv
+                    self.data_table.setItem(row, 4, QTableWidgetItem(f"{rel:.2f}"))
+                else:
+                    self.data_table.setItem(row, 4, QTableWidgetItem("N/A"))
+            else:
+                if global_ref is not None and val is not None:
+                    rel = (val - global_ref) * conv
+                    self.data_table.setItem(row, 4, QTableWidgetItem(f"{rel:.2f}"))
+                else:
+                    self.data_table.setItem(row, 4, QTableWidgetItem("N/A"))
+
+            file_names = ", ".join([os.path.basename(p) for p, _m in it.file_data])
+            self.data_table.setItem(row, 5, QTableWidgetItem(file_names))
+
+            color_item = QTableWidgetItem()
+            color = it.custom_color or self.folders.get(it.folder_path, {'color': '#3b82f6'})['color']
+            color_item.setBackground(QColor(color))
+            color_item.setText(color)
+            self.data_table.setItem(row, 6, color_item)
+
+    # ==================== Plotting Engine ====================
+    def update_plot(self):
+        if not self.plot_staging_list:
+            self.ax.clear()
+            self.canvas.draw()
+            return
+
+        self.update_data_table()
+        self.update_zero_reference_combo()
+
+        theme = self.theme_combo.currentText()
+        mpl_style.use('default' if theme == "Default" else theme)
+
+        is_pub = self.check_pub_quality.isChecked()
+        matplotlib.rcParams.update({
+            'font.family': 'serif' if is_pub else 'sans-serif',
+            'font.serif': ['Times New Roman', 'DejaVu Serif', 'serif'],
+            'font.sans-serif': ['Arial', 'DejaVu Sans', 'sans-serif'],
+            'font.size': self.base_fs_spin.value(),
+            'xtick.direction': 'in' if self.check_inward_ticks.isChecked() else 'out',
+            'ytick.direction': 'in' if self.check_inward_ticks.isChecked() else 'out',
+            'axes.linewidth': 1.2,
+            'axes.edgecolor': '#495057',
+            'axes.facecolor': 'white',
+        })
+
+        self.fig.clear()
+        self.ax = self.fig.add_subplot(111)
+        self.fig.set_size_inches(self.fig_width_spin.value(), self.fig_height_spin.value())
+        self.fig.subplots_adjust(left=self.margin_left_spin.value(), right=0.95, top=0.9, bottom=0.15)
+        self.fig.set_facecolor('#f9fafb' if not self.check_shadow.isChecked() else 'white')
+
+        e_type = self.energy_type_combo.currentText().lower()
+        conv = self._conv_factor()
+        ref_mode = self.zero_ref_combo.currentText()
+
+        # Determine global reference if needed
+        if ref_mode == "Per Pathway (First State)":
+            global_ref = None
+        else:
+            global_ref = self.get_reference_energy()
+
+        tick_pos, tick_labels = [], []
+        curr_x, max_x = 0, 0
+        is_ov = self.check_overlay.isChecked()
+        hw = self.state_width_slider.value() / 2.0
+
+        raw_ls = self.line_style_combo.currentText()
+        line_style = _LINESTYLE_MAP.get(raw_ls, '-')
+
+        bar_thick = self.bar_thickness_spin.value()
+        t_fs = self.tick_fs_spin.value()
+        t_b = 'bold' if self.check_tick_bold.isChecked() else 'normal'
+        e_fs = self.energy_fs_spin.value()
+        e_b = 'bold' if self.check_energy_bold.isChecked() else 'normal'
+        d_fs = self.delta_fs_spin.value()
+        d_b = 'bold' if self.check_delta_bold.isChecked() else 'normal'
+
+        # Group by folder
+        grouped = {}
+        for idx, it in enumerate(self.plot_staging_list):
+            grouped.setdefault(it.folder_path, []).append((idx, it))
+
+        for f_path, items in grouped.items():
+            color = self.folders.get(f_path, {'color': '#3b82f6'})['color']
+            count = len(items)
+
+            # Determine reference energy for this folder (first state) if per‑pathway mode
+            if ref_mode == "Per Pathway (First State)":
+                first_item = items[0][1]  # first PlotItem in this folder
+                first_val = self.calculate_state_energy(first_item, e_type)
+                folder_ref = first_val
+            else:
+                folder_ref = global_ref
+
+            for i, (orig_idx, it) in enumerate(items):
+                lx = i if is_ov else (curr_x + i)
+                max_x = max(max_x, lx)
+                val = self.calculate_state_energy(it, e_type)
+                if val is None or folder_ref is None:
+                    continue
+                y = (val - folder_ref) * conv
+                draw_c = it.custom_color if it.custom_color else color
+
+                if self.check_shadow.isChecked():
+                    self.ax.plot([lx - hw, lx + hw], [y, y], color='gray', lw=bar_thick + 1,
+                                 alpha=0.3, zorder=4, solid_capstyle='butt')
+                self.ax.plot([lx - hw, lx + hw], [y, y], color=draw_c, lw=bar_thick,
+                             zorder=5, solid_capstyle='butt')
+
+                if self.check_show_e_labels.isChecked():
+                    dx, dy = it.label_offset
+                    label_color = it.label_font_color or draw_c
+                    font_size = it.label_font_size or e_fs
+                    font_weight = it.label_font_weight if it.label_font_weight != 'normal' else e_b
+                    self.ax.text(lx + dx, y + dy, f"{y:.1f}", ha='center', va='bottom',
+                                 color=label_color, fontweight=font_weight, fontsize=font_size,
+                                 bbox=dict(boxstyle="round,pad=0.3", facecolor='white', edgecolor=label_color, alpha=0.8))
+
+                label = it.custom_name if it.custom_name else f"S{lx}"
+                if lx not in tick_pos:
+                    tick_pos.append(lx)
+                    tick_labels.append(label)
+
+                if i < count - 1:
+                    next_val = self.calculate_state_energy(items[i+1][1], e_type)
+                    if next_val is not None and folder_ref is not None:
+                        ny = (next_val - folder_ref) * conv
+                        next_lx = (i + 1) if is_ov else (curr_x + i + 1)
+
+                        if self.check_smooth.isChecked():
+                            xs = np.linspace(lx + hw, next_lx - hw, 40)
+                            ts = (xs - (lx + hw)) / (next_lx - lx - 2 * hw)
+                            ys = y + (ny - y) * (3 * ts ** 2 - 2 * ts ** 3)
+                            self.ax.plot(xs, ys, color=color, ls=line_style, alpha=0.5, lw=bar_thick * 0.4, zorder=3)
+                        else:
+                            self.ax.plot([lx + hw, next_lx - hw], [y, ny], color=color, ls=line_style,
+                                         alpha=0.5, lw=bar_thick * 0.4, zorder=3)
+
+                        if self.check_show_delta.isChecked():
+                            mid_x = (lx + next_lx) / 2.0
+                            mid_y = (y + ny) / 2.0
+                            dx, dy = it.delta_offset
+                            self.ax.annotate(fr"$\Delta = {ny - y:+.1f}$", xy=(mid_x, mid_y),
+                                             xytext=(mid_x + dx, mid_y + dy), ha='center', color=color,
+                                             fontsize=d_fs, fontweight=d_b, zorder=10,
+                                             arrowprops=dict(arrowstyle='->', color=color, lw=0.8, alpha=0.5,
+                                                             shrinkA=5, shrinkB=5))
+
+            if not is_ov:
+                curr_x += count
+
+            self.ax.plot([], [], color=color, label=os.path.basename(f_path), lw=2)
+
+        self.ax.set_title(self.title_input.text() if self.title_input.text() != "None" else "",
+                          fontsize=self.base_fs_spin.value() + 2, fontweight='bold', pad=15)
+        self.ax.set_ylabel(self.y_label_input.text(), fontsize=self.base_fs_spin.value(), labelpad=10)
+
+        self.ax.set_xticks(tick_pos)
+        self.ax.set_xticklabels(tick_labels)
+        for lbl in self.ax.get_xticklabels():
+            lbl.set_fontsize(t_fs)
+            lbl.set_fontweight(t_b)
+        for lbl in self.ax.get_yticklabels():
+            lbl.set_fontsize(t_fs)
+
+        self.ax.set_xlim(-0.75, max_x + 0.75)
+
+        # Auto-pad Y-axis for label readability
+        y_min, y_max = self.ax.get_ylim()
+        y_range = y_max - y_min if y_max != y_min else 1.0
+        self.ax.set_ylim(y_min - 0.08 * y_range, y_max + 0.12 * y_range)
+
+        if self.check_grid.isChecked():
+            self.ax.grid(True, axis='y', alpha=0.15, ls=':', color='gray')
+            self.ax.grid(True, axis='x', alpha=0.05, ls=':', color='gray')
+
+        if self.check_show_legend.isChecked():
+            loc = self.legend_loc_combo.currentText()
+            legend = self.ax.legend(loc=loc, frameon=True, fancybox=True, framealpha=0.9, edgecolor='gray')
+            legend.get_frame().set_linewidth(0.5)
+
+        self.ax.get_xaxis().set_visible(self.check_show_xaxis.isChecked())
+        self.ax.get_yaxis().set_visible(self.check_show_yaxis.isChecked())
+        self.ax.set_frame_on(self.check_show_frame.isChecked())
+
+        if self.check_shadow.isChecked():
+            self.ax.set_facecolor('#f9fafb')
+
+        self.canvas.draw()
+        self.statusBar().showMessage("Plot updated", 2000)
+
+    # ==================== Utilities ====================
+    def copy_to_clipboard(self):
+        buf = BytesIO()
+        self.fig.savefig(buf, format='png', dpi=1200, bbox_inches='tight', facecolor=self.fig.get_facecolor())
+        img = QPixmap()
+        img.loadFromData(buf.getvalue())
+        QApplication.clipboard().setPixmap(img)
+        self.statusBar().showMessage("✅ Copied High-Res (1200 DPI) to Clipboard!", 3000)
+
+    def export_image(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Publication Graphic", "orca_profile.svg",
+            "Vector (*.svg);;High-Res Image (*.png);;Publication PDF (*.pdf);;TIFF (*.tiff)")
+        if path:
+            dpi = 1200 if not path.endswith('.svg') else 300
+            self.fig.savefig(path, dpi=dpi, bbox_inches='tight', facecolor=self.fig.get_facecolor())
+            self.statusBar().showMessage(f"✅ Exported to {os.path.basename(path)}", 3000)
+
+    def export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Data", "orca_data.csv", "CSV (*.csv)")
+        if path:
+            try:
+                with open(path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    headers = [self.data_table.horizontalHeaderItem(col).text() for col in range(self.data_table.columnCount())]
+                    writer.writerow(headers)
+                    for row in range(self.data_table.rowCount()):
+                        row_data = []
+                        for col in range(self.data_table.columnCount()):
+                            item = self.data_table.item(row, col)
+                            row_data.append(item.text() if item else "")
+                        writer.writerow(row_data)
+                self.statusBar().showMessage(f"✅ Data exported to {os.path.basename(path)}", 3000)
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to export CSV: {str(e)}")
+
+    def rename_selected_state(self):
+        row = self.staging_list.currentRow()
+        if row == -1:
+            QMessageBox.warning(self, "No Selection", "Please select a state to rename.")
+            return
+        self.undo_mgr.push(self.plot_staging_list)
+        new_name = self.rename_input.text().strip()
+        if new_name:
+            self.plot_staging_list[row].custom_name = new_name
+        else:
+            self.plot_staging_list[row].custom_name = None
+        self._dirty = True
+        self.sync_sidebar_list()
+        self.update_plot()
+        if new_name:
+            self.statusBar().showMessage(f"Renamed state to '{new_name}'", 3000)
+
+    def color_selected_state(self):
+        row = self.staging_list.currentRow()
+        if row == -1:
+            QMessageBox.warning(self, "No Selection", "Please select a state to color.")
+            return
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.undo_mgr.push(self.plot_staging_list)
+            self.plot_staging_list[row].custom_color = color.name()
+            self._dirty = True
+            self.sync_sidebar_list()
+            self.update_plot()
+            self.statusBar().showMessage("State color updated", 3000)
+
+    def move_staging_item(self, direction):
+        row = self.staging_list.currentRow()
+        target = row + direction
+        if 0 <= target < len(self.plot_staging_list):
+            self.undo_mgr.push(self.plot_staging_list)
+            self.plot_staging_list[row], self.plot_staging_list[target] = self.plot_staging_list[target], self.plot_staging_list[row]
+            self._dirty = True
+            self.sync_sidebar_list()
+            self.staging_list.setCurrentRow(target)
+            self.update_plot()
+            self.statusBar().showMessage("State order updated", 2000)
+
+    def move_table_item(self, direction):
+        row = self.data_table.currentRow()
+        target = row + direction
+        if 0 <= target < len(self.plot_staging_list):
+            self.undo_mgr.push(self.plot_staging_list)
+            self.plot_staging_list[row], self.plot_staging_list[target] = self.plot_staging_list[target], self.plot_staging_list[row]
+            self._dirty = True
+            self.sync_sidebar_list()
+            self.update_plot()
+            self.data_table.setCurrentCell(target, 0)
+            self.statusBar().showMessage("State order updated", 2000)
+
+    def sync_sidebar_list(self):
+        self.staging_list.clear()
+        for it in self.plot_staging_list:
+            display = f"({it.custom_name}) {it.display_name}" if it.custom_name else it.display_name
+            li = QListWidgetItem(display)
+            c = it.custom_color or self.folders.get(it.folder_path, {'color': '#3b82f6'})['color']
+            li.setForeground(QColor(c))
+            files_info = "\n".join([f"{m}× {os.path.basename(p)}" for p, m in it.file_data])
+            li.setToolTip(f"Files:\n{files_info}")
+            li.setData(Qt.UserRole, it)
+            self.staging_list.addItem(li)
+        self.filter_staging_list()
+
+    def remove_staged_items(self):
+        rows = sorted([idx.row() for idx in self.staging_list.selectedIndexes()], reverse=True)
+        if not rows:
+            return
+        reply = QMessageBox.question(self, "Remove Items", f"Remove {len(rows)} selected item(s)?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.undo_mgr.push(self.plot_staging_list)
+            for i in rows:
+                self.plot_staging_list.pop(i)
+                self.staging_list.takeItem(i)
+            self._dirty = True
+            self.update_plot()
+            self.statusBar().showMessage(f"Removed {len(rows)} item(s)", 3000)
+
+    def remove_table_items(self):
+        rows = sorted(set(index.row() for index in self.data_table.selectedIndexes()), reverse=True)
+        if not rows:
+            return
+        reply = QMessageBox.question(self, "Remove Items", f"Remove {len(rows)} selected row(s)?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.undo_mgr.push(self.plot_staging_list)
+            for row in rows:
+                self.plot_staging_list.pop(row)
+            self._dirty = True
+            self.sync_sidebar_list()
+            self.update_plot()
+            self.statusBar().showMessage(f"Removed {len(rows)} row(s)", 3000)
+
+    def clear_staging(self):
+        if self.plot_staging_list:
+            reply = QMessageBox.question(self, "Clear All", "Clear all items from staging?",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.undo_mgr.push(self.plot_staging_list)
+                self.plot_staging_list.clear()
+                self.staging_list.clear()
+                self._dirty = True
+                self.update_plot()
+                self.statusBar().showMessage("Staging cleared", 3000)
+
+    def new_session(self, _skip_prompt=False):
+        """Reset everything. Pass _skip_prompt=True for internal use (e.g. load_session)."""
+        if not _skip_prompt and self.plot_staging_list:
+            reply = QMessageBox.question(self, "New Session", "Start new session? Current work will be lost.",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
+        self.plot_staging_list.clear()
+        self.staging_list.clear()
+        self.folders.clear()
+        while self.tab_folders.count() > 0:
+            self.tab_folders.removeTab(0)
+        self._dirty = False
+        self.update_plot()
+        self.statusBar().showMessage("New session started", 3000)
+
+    def _gather_all_settings(self) -> dict:
+        """Collect every UI widget state into a dictionary for session persistence."""
+        return {
+            'title': self.title_input.text(),
+            'y_label': self.y_label_input.text(),
+            'energy_type': self.energy_type_combo.currentText(),
+            'theme': self.theme_combo.currentText(),
+            'legend_loc': self.legend_loc_combo.currentText(),
+            'line_style': self.line_style_combo.currentText(),
+            'zero_ref': self.zero_ref_combo.currentText(),
+            'width': self.fig_width_spin.value(),
+            'height': self.fig_height_spin.value(),
+            'state_width': self.state_width_slider.value(),
+            'bar_thickness': self.bar_thickness_spin.value(),
+            'margin_left': self.margin_left_spin.value(),
+            'base_fs': self.base_fs_spin.value(),
+            'tick_fs': self.tick_fs_spin.value(),
+            'energy_fs': self.energy_fs_spin.value(),
+            'delta_fs': self.delta_fs_spin.value(),
+            # Checkboxes
+            'show_legend': self.check_show_legend.isChecked(),
+            'pub_quality': self.check_pub_quality.isChecked(),
+            'show_e_labels': self.check_show_e_labels.isChecked(),
+            'show_delta': self.check_show_delta.isChecked(),
+            'auto_align': self.check_auto_align.isChecked(),
+            'interactive': self.check_interactive.isChecked(),
+            'tick_bold': self.check_tick_bold.isChecked(),
+            'energy_bold': self.check_energy_bold.isChecked(),
+            'delta_bold': self.check_delta_bold.isChecked(),
+            'show_xaxis': self.check_show_xaxis.isChecked(),
+            'show_yaxis': self.check_show_yaxis.isChecked(),
+            'show_frame': self.check_show_frame.isChecked(),
+            'inward_ticks': self.check_inward_ticks.isChecked(),
+            'grid': self.check_grid.isChecked(),
+            'smooth': self.check_smooth.isChecked(),
+            'overlay': self.check_overlay.isChecked(),
+            'shadow': self.check_shadow.isChecked(),
+            # Unit buttons
+            'unit_kcal': self.btn_kcal.isChecked(),
+            'unit_kj': self.btn_kj.isChecked(),
+            'unit_ev': self.btn_ev.isChecked(),
+        }
+
+    def _restore_all_settings(self, s: dict):
+        """Restore UI widget states from a settings dictionary."""
+        self.title_input.setText(s.get('title', 'Reaction Energy Profile'))
+        self.y_label_input.setText(s.get('y_label', 'Relative Energy (kcal/mol)'))
+        for combo, key, default in [
+            (self.energy_type_combo, 'energy_type', 'Gibbs'),
+            (self.theme_combo, 'theme', 'Default'),
+            (self.legend_loc_combo, 'legend_loc', 'best'),
+            (self.line_style_combo, 'line_style', 'Solid (-)'),
+        ]:
+            idx = combo.findText(s.get(key, default))
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        self.fig_width_spin.setValue(s.get('width', 10.0))
+        self.fig_height_spin.setValue(s.get('height', 7.0))
+        self.state_width_slider.setValue(s.get('state_width', 0.6))
+        self.bar_thickness_spin.setValue(s.get('bar_thickness', 3.5))
+        self.margin_left_spin.setValue(s.get('margin_left', 0.12))
+        self.base_fs_spin.setValue(s.get('base_fs', 10))
+        self.tick_fs_spin.setValue(s.get('tick_fs', 10))
+        self.energy_fs_spin.setValue(s.get('energy_fs', 9))
+        self.delta_fs_spin.setValue(s.get('delta_fs', 8))
+        # Checkboxes
+        for attr, key, default in [
+            ('check_show_legend', 'show_legend', True),
+            ('check_pub_quality', 'pub_quality', False),
+            ('check_show_e_labels', 'show_e_labels', True),
+            ('check_show_delta', 'show_delta', True),
+            ('check_auto_align', 'auto_align', True),
+            ('check_interactive', 'interactive', True),
+            ('check_tick_bold', 'tick_bold', False),
+            ('check_energy_bold', 'energy_bold', True),
+            ('check_delta_bold', 'delta_bold', True),
+            ('check_show_xaxis', 'show_xaxis', True),
+            ('check_show_yaxis', 'show_yaxis', True),
+            ('check_show_frame', 'show_frame', True),
+            ('check_inward_ticks', 'inward_ticks', True),
+            ('check_grid', 'grid', True),
+            ('check_smooth', 'smooth', True),
+            ('check_overlay', 'overlay', True),
+            ('check_shadow', 'shadow', False),
+        ]:
+            getattr(self, attr).setChecked(s.get(key, default))
+        # Units
+        self.btn_kcal.setChecked(s.get('unit_kcal', True))
+        self.btn_kj.setChecked(s.get('unit_kj', False))
+        self.btn_ev.setChecked(s.get('unit_ev', False))
+
+    def save_session(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Session", "", "JSON (*.json)")
+        if path:
+            try:
+                session_data = {
+                    'version': 2,
+                    'staging': [it.to_dict() for it in self.plot_staging_list],
+                    'folders': list(self.folders.keys()),
+                    'settings': self._gather_all_settings(),
+                }
+                with open(path, 'w') as f:
+                    json.dump(session_data, f, indent=4, default=str)
+                self._dirty = False
+                self.statusBar().showMessage(f"✅ Session saved to {os.path.basename(path)}", 3000)
+            except Exception as e:
+                QMessageBox.critical(self, "Save Error", f"Failed to save session: {str(e)}")
+
+    def load_session(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Session", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+
+            # Skip the "are you sure?" prompt during load
+            self.new_session(_skip_prompt=True)
+
+            for d in data.get('staging', []):
+                for key in ('label_offset', 'delta_offset'):
+                    v = d.get(key)
+                    if isinstance(v, list):
+                        pass
+                    elif isinstance(v, str):
+                        try:
+                            parsed = json.loads(v)
+                            if isinstance(parsed, list):
+                                d[key] = parsed
+                        except (json.JSONDecodeError, ValueError):
+                            d[key] = [0.0, 0.5] if key == 'label_offset' else [0.05, 0.0]
+                    else:
+                        d[key] = [0.0, 0.5] if key == 'label_offset' else [0.05, 0.0]
+
+                it = PlotItem(**d)
+                self.plot_staging_list.append(it)
+
+            for folder_path in data.get('folders', []):
+                if os.path.exists(folder_path):
+                    loader = FolderLoader(folder_path)
+                    loader.finished.connect(self.on_folder_loaded)
+                    loader.finished.connect(loader.deleteLater)
+                    loader.start()
+
+            self._restore_all_settings(data.get('settings', {}))
+
+            self.sync_sidebar_list()
+            self._dirty = False
+            self.update_plot()
+            self.statusBar().showMessage(f"✅ Session loaded from {os.path.basename(path)}", 3000)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", f"Failed to load session: {str(e)}")
+
+    def import_data(self):
+        """Import energy data from a CSV file (columns: Label, Energy_Eh, Color[optional])."""
+        path, _ = QFileDialog.getOpenFileName(self, "Import CSV Data", "", "CSV Files (*.csv);;All Files (*)")
+        if not path:
+            return
+        try:
+            with open(path, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                required = {'Label', 'Energy_Eh'}
+                if not required.issubset(set(reader.fieldnames or [])):
+                    QMessageBox.warning(self, "Invalid CSV",
+                        f"CSV must have columns: {', '.join(required)}\n"
+                        f"Found: {', '.join(reader.fieldnames or [])}")
+                    return
+
+                count = 0
+                for row in reader:
+                    label = row.get('Label', '').strip()
+                    energy_str = row.get('Energy_Eh', '').strip()
+                    color = row.get('Color', '').strip() or None
+                    if not label or not energy_str:
+                        continue
+                    try:
+                        energy_val = float(energy_str)
+                    except ValueError:
+                        continue
+
+                    item = PlotItem(
+                        file_data=[],
+                        display_name=label,
+                        folder_path='__imported__',
+                        energy=energy_val,
+                        custom_color=color,
+                    )
+                    self.plot_staging_list.append(item)
+                    li = QListWidgetItem(f"[CSV] {label}")
+                    if color:
+                        li.setForeground(QColor(color))
+                    self.staging_list.addItem(li)
+                    count += 1
+
+            self._dirty = True
+            self.update_plot()
+            self.statusBar().showMessage(f"✅ Imported {count} entries from CSV", 3000)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Failed to import CSV: {str(e)}")
+
+    def apply_journal_preset(self, index):
+        p = self.journal_preset_combo.currentText()
+        if p == "Custom":
+            return
+        self.check_pub_quality.setChecked(True)
+        self.check_inward_ticks.setChecked(True)
+        self.check_grid.setChecked(False)
+        self.margin_left_spin.setValue(0.15)
+        self.check_shadow.setChecked(False)
+
+        if "JACS (Single Column)" in p:
+            self.fig_width_spin.setValue(3.25)
+            self.fig_height_spin.setValue(2.7)
+            self.base_fs_spin.setValue(8)
+            self.tick_fs_spin.setValue(8)
+            self.energy_fs_spin.setValue(7)
+            self.delta_fs_spin.setValue(7)
+        elif "JACS (Double Column)" in p:
+            self.fig_width_spin.setValue(7.0)
+            self.fig_height_spin.setValue(5.0)
+            self.base_fs_spin.setValue(10)
+            self.tick_fs_spin.setValue(10)
+            self.energy_fs_spin.setValue(9)
+            self.delta_fs_spin.setValue(9)
+        elif "Nature" in p or "Science" in p:
+            self.fig_width_spin.setValue(3.5)
+            self.fig_height_spin.setValue(3.0)
+            self.base_fs_spin.setValue(7)
+            self.tick_fs_spin.setValue(7)
+            self.energy_fs_spin.setValue(6)
+            self.delta_fs_spin.setValue(6)
+        elif "Angewandte" in p:
+            self.fig_width_spin.setValue(8.5)
+            self.fig_height_spin.setValue(6.0)
+            self.base_fs_spin.setValue(9)
+            self.tick_fs_spin.setValue(9)
+            self.energy_fs_spin.setValue(8)
+            self.delta_fs_spin.setValue(8)
+        elif "ACS Catalysis" in p:
+            self.fig_width_spin.setValue(3.5)
+            self.fig_height_spin.setValue(2.8)
+            self.base_fs_spin.setValue(8)
+            self.tick_fs_spin.setValue(8)
+            self.energy_fs_spin.setValue(7)
+            self.delta_fs_spin.setValue(7)
+
+        self.update_plot()
+        self.statusBar().showMessage(f"Applied {p} preset", 3000)
+
+    def apply_quick_style(self, style_name):
+        if style_name == "Light":
+            self.control_panel.setStyleSheet("background-color: #f0f0f0; color: #111111;")
+            self.theme_combo.setCurrentText("Default")
+            self.check_pub_quality.setChecked(False)
+        elif style_name == "Dark":
+            self.control_panel.setStyleSheet("""
+                background-color: #1a1a2e; color: #f0f0f0;
+                QLabel { color: #f0f0f0; }
+                QCheckBox { color: #f0f0f0; }
+                QGroupBox { color: #f0f0f0; border-color: #4b5563; background-color: #2d2d44; }
+                QGroupBox::title { color: #f0f0f0; }
+            """)
+            self.theme_combo.setCurrentText("dark_background")
+            self.check_pub_quality.setChecked(False)
+        elif style_name == "Colorful":
+            self.control_panel.setStyleSheet("""
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #7c3aed, stop:0.5 #2563eb, stop:1 #059669);
+                color: #ffffff;
+                QLabel { color: #ffffff; }
+                QCheckBox { color: #ffffff; }
+                QGroupBox { color: #ffffff; border-color: rgba(255,255,255,0.3); background-color: rgba(0,0,0,0.2); }
+                QGroupBox::title { color: #ffffff; }
+            """)
+            self.theme_combo.setCurrentText("seaborn-v0_8")
+            self.check_pub_quality.setChecked(False)
+        self.update_plot()
+        self.statusBar().showMessage(f"Applied {style_name} style", 3000)
+
+    def show_about(self):
+        about_text = """
+        <h2>ORCA Professional Plotter v5.0</h2>
+        <p>Advanced energy profile visualization tool for quantum chemistry calculations.</p>
+        <p><b>Features:</b></p>
+        <ul>
+            <li>Publication-ready graphics (1200 DPI)</li>
+            <li>Interactive label editing and dragging</li>
+            <li>Multiple energy types (Gibbs, Enthalpy, Electronic)</li>
+            <li>Custom color schemes and fonts</li>
+            <li>Journal-specific presets (JACS, Nature, Angewandte, ACS Catalysis)</li>
+            <li>Global file explorer</li>
+            <li>Thermodynamic data table with CSV export</li>
+            <li><b>Per‑pathway zero (first state) for uniform scaling</b></li>
+            <li><b>Undo / Redo (Ctrl+Z / Ctrl+Shift+Z)</b></li>
+            <li><b>CSV data import</b></li>
+            <li><b>Full session save/restore</b></li>
+            <li><b>Cached file parsing for performance</b></li>
+        </ul>
+        <p><b>Designed for:</b> Quantum chemists, researchers, and students</p>
+        <p>© 2024–2026 ORCA Plotter Development Team</p>
+        """
+        QMessageBox.about(self, "About ORCA Professional Plotter", about_text)
+
+    # --------------------------------------------------------
+    # Close event — warns about unsaved changes
+    # --------------------------------------------------------
+    def closeEvent(self, event):
+        if self._dirty:
+            reply = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved changes. Are you sure you want to quit?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+            if reply == QMessageBox.Save:
+                self.save_session()
+                event.accept()
+            elif reply == QMessageBox.Discard:
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+
+# ==================== Entry Point ====================
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setStyleSheet("""
+        /* ---- Global high-contrast text ---- */
+        * {
+            color: #111111;
+            font-family: "Segoe UI", Arial, sans-serif;
+        }
+        QMainWindow {
+            background-color: #f0f0f0;
+        }
+        QPushButton {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 8px;
+            background-color: #2563eb;
+            color: #ffffff;
+            font-weight: 600;
+            font-size: 12px;
+        }
+        QPushButton:hover {
+            background-color: #1d4ed8;
+        }
+        QPushButton:pressed {
+            background-color: #1e3a8a;
+        }
+        QPushButton:disabled {
+            background-color: #9ca3af;
+            color: #d1d5db;
+        }
+        QLabel {
+            color: #111111;
+            font-size: 12px;
+        }
+        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+            padding: 8px;
+            border: 1px solid #9ca3af;
+            border-radius: 8px;
+            background-color: #ffffff;
+            color: #111111;
+            font-size: 12px;
+        }
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+            border: 2px solid #2563eb;
+            outline: none;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #ffffff;
+            color: #111111;
+            selection-background-color: #2563eb;
+            selection-color: #ffffff;
+        }
+        QCheckBox {
+            spacing: 8px;
+            font-size: 12px;
+            color: #111111;
+        }
+        QCheckBox::indicator {
+            width: 18px;
+            height: 18px;
+        }
+        QGroupBox {
+            font-weight: bold;
+            border: 1px solid #9ca3af;
+            border-radius: 12px;
+            margin-top: 12px;
+            padding-top: 16px;
+            background-color: #ffffff;
+            color: #111111;
+            font-size: 13px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 16px;
+            padding: 0 8px 0 8px;
+            color: #000000;
+        }
+        QToolBar {
+            background-color: #e5e7eb;
+            border-bottom: 2px solid #9ca3af;
+            spacing: 4px;
+        }
+        QToolBar QToolButton {
+            color: #111111;
+            font-weight: 500;
+            padding: 4px 8px;
+        }
+        QToolBar QToolButton:hover {
+            background-color: #d1d5db;
+            border-radius: 4px;
+        }
+        QStatusBar {
+            background-color: #e5e7eb;
+            color: #111111;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        QTabWidget::pane {
+            border: 2px solid #9ca3af;
+            background-color: #ffffff;
+        }
+        QTabBar::tab {
+            color: #111111;
+            background-color: #e5e7eb;
+            border: 1px solid #9ca3af;
+            padding: 8px 16px;
+            font-weight: bold;
+        }
+        QTabBar::tab:selected {
+            background-color: #ffffff;
+            color: #1e3a8a;
+            border-bottom-color: #ffffff;
+        }
+        QTabBar::tab:hover {
+            background-color: #d1d5db;
+        }
+        QListWidget {
+            color: #111111;
+            background-color: #ffffff;
+            border: 1px solid #9ca3af;
+        }
+        QListWidget::item {
+            color: #111111;
+        }
+        QListWidget::item:selected {
+            background-color: #2563eb;
+            color: #ffffff;
+        }
+        QTableWidget {
+            color: #111111;
+            background-color: #ffffff;
+            gridline-color: #9ca3af;
+        }
+        QHeaderView::section {
+            background-color: #e5e7eb;
+            color: #111111;
+            font-weight: bold;
+            border: 1px solid #9ca3af;
+            padding: 6px;
+        }
+        QTableWidget::item:selected {
+            background-color: #2563eb;
+            color: #ffffff;
+        }
+        QScrollBar:vertical {
+            border: none;
+            background-color: #e5e7eb;
+            width: 12px;
+        }
+        QScrollBar::handle:vertical {
+            background-color: #6b7280;
+            border-radius: 6px;
+            min-height: 30px;
+        }
+        QMenuBar {
+            background-color: #e5e7eb;
+            color: #111111;
+        }
+        QMenuBar::item:selected {
+            background-color: #2563eb;
+            color: #ffffff;
+        }
+        QMenu {
+            background-color: #ffffff;
+            color: #111111;
+            border: 1px solid #9ca3af;
+        }
+        QMenu::item:selected {
+            background-color: #2563eb;
+            color: #ffffff;
+        }
+    """)
+
+    window = OrcaAnalyzerApp()
+    window.show()
+    sys.exit(app.exec())

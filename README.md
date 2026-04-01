@@ -44,9 +44,11 @@ Dirty state tracking (self._dirty) across all mutations
 Smart close event: Save / Discard / Cancel dialog when dirty
 Window title updated to v5.0
 About dialog lists all new features
-8. Plot Quality
+9. Plot Quality
 Automatic Y-axis padding: 8% below, 12% above data range for label clearance
 Verified
 ✅ Python syntax validation passed (py_compile.compile with Python 3.x)
 ✅ All existing features preserved — no breaking changes
 ✅ Old session files still load (backward compatible, just missing new settings which use defaults)
+<img width="1787" height="1016" alt="image" src="https://github.com/user-attachments/assets/d49c1ccd-9750-4fbf-adff-84f5d68eeb71" />
+<img width="945" height="343" alt="image" src="https://github.com/user-attachments/assets/bd3f1b02-be0f-41a7-abc2-1a32cc3f481e" />
